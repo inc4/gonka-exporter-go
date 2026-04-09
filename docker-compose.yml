@@ -1,0 +1,53 @@
+services:
+  node-exporter:
+    image: prom/node-exporter:latest
+    container_name: node-exporter
+    restart: unless-stopped
+    pid: host
+    network_mode: host
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    command:
+      - '--path.procfs=/host/proc'
+      - '--path.sysfs=/host/sys'
+      - '--path.rootfs=/rootfs'
+      - '--web.listen-address=:9101'
+      - '--collector.disable-defaults'
+      - '--collector.cpu'
+      - '--collector.meminfo'
+      - '--collector.diskstats'
+      - '--collector.filesystem'
+      - '--collector.loadavg'
+      - '--collector.netdev'
+
+  gonka-exporter:
+    build: .
+    container_name: gonka-exporter
+    restart: unless-stopped
+    networks:
+      - gonka-network
+    ports:
+      - "${EXPORTER_PORT:-9401}:9401"
+    volumes:
+      - epoch-data:/data
+    environment:
+      - PARTICIPANT_ADDRESS=${PARTICIPANT_ADDRESS}
+      - REFRESH_INTERVAL=${REFRESH_INTERVAL:-30}
+      - NODE_RPC_URL=${NODE_RPC_URL:-http://node:26657}
+      - NODE_REST_URL=${NODE_REST_URL:-http://node:1317}
+      - API_URL=${API_URL:-http://api:9000}
+      - ADMIN_API_URL=${ADMIN_API_URL:-http://api:9200}
+      - EPOCH_HISTORY_FILE=/data/epoch_history.json
+      - STATE_FILE=/data/exporter_state.json
+      - MAX_EPOCH_HISTORY=${MAX_EPOCH_HISTORY:-500}
+
+volumes:
+  epoch-data:
+    driver: local
+
+networks:
+  gonka-network:
+    external: true
+    name: ${GONKA_NETWORK:-gonka-node_default}

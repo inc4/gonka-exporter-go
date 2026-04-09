@@ -1,0 +1,429 @@
+package fetcher
+
+import (
+	"encoding/json"
+	"fmt"
+	"io"
+	"math/rand/v2"
+	"net/http"
+	"strconv"
+	"strings"
+	"time"
+)
+
+var httpClient = &http.Client{Timeout: 10 * time.Second}
+
+// flexInt64 accepts both JSON number and JSON string for the same field.
+type flexInt64 int64
+
+func (f *flexInt64) UnmarshalJSON(data []byte) error {
+	var n int64
+	if err := json.Unmarshal(data, &n); err == nil {
+		*f = flexInt64(n)
+		return nil
+	}
+	var s string
+	if err := json.Unmarshal(data, &s); err != nil {
+		return err
+	}
+	n, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return err
+	}
+	*f = flexInt64(n)
+	return nil
+}
+
+func get(url string, dest any) error {
+	resp, err := httpClient.Get(url)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(body, dest)
+}
+
+// --- Tendermint RPC ---
+
+type TendermintStatus struct {
+	Result struct {
+		SyncInfo struct {
+			LatestBlockHeight string `json:"latest_block_height"`
+			LatestBlockTime   string `json:"latest_block_time"`
+			CatchingUp        bool   `json:"catching_up"`
+		} `json:"sync_info"`
+	} `json:"result"`
+}
+
+func FetchTendermintStatus(rpcURL string) (*TendermintStatus, error) {
+	var s TendermintStatus
+	err := get(rpcURL+"/status", &s)
+	return &s, err
+}
+
+func FetchBlockTimeAtHeight(rpcURL string, height int64) (float64, error) {
+	var resp struct {
+		Result struct {
+			Block struct {
+				Header struct {
+					Time string `json:"time"`
+				} `json:"header"`
+			} `json:"block"`
+		} `json:"result"`
+	}
+	if err := get(fmt.Sprintf("%s/block?height=%d", rpcURL, height), &resp); err != nil {
+		return 0, err
+	}
+	t := resp.Result.Block.Header.Time
+	if t == "" {
+		return 0, fmt.Errorf("empty time")
+	}
+	t = strings.TrimSuffix(t, "Z")
+	parsed, err := time.Parse("2006-01-02T15:04:05.999999999", t)
+	if err != nil {
+		parsed, err = time.Parse(time.RFC3339Nano, t+"Z")
+		if err != nil {
+			return 0, fmt.Errorf("parse time %q: %w", t, err)
+		}
+	}
+	return float64(parsed.UTC().Unix()) + float64(parsed.Nanosecond())/1e9, nil
+}
+
+func FetchMaxBlockHeightFromNodes(nodes []string) (int64, string) {
+	sample := rand.Perm(len(nodes))
+	if len(sample) > 5 {
+		sample = sample[:5]
+	}
+	var maxHeight int64
+	var latestTime string
+	for _, i := range sample {
+		var resp struct {
+			Result struct {
+				SyncInfo struct {
+					LatestBlockHeight string `json:"latest_block_height"`
+					LatestBlockTime   string `json:"latest_block_time"`
+				} `json:"sync_info"`
+			} `json:"result"`
+		}
+		if err := get(nodes[i]+"/chain-rpc/status", &resp); err != nil {
+			continue
+		}
+		h, err := strconv.ParseInt(resp.Result.SyncInfo.LatestBlockHeight, 10, 64)
+		if err == nil && h > maxHeight {
+			maxHeight = h
+			latestTime = resp.Result.SyncInfo.LatestBlockTime
+		}
+	}
+	return maxHeight, latestTime
+}
+
+// --- Chain REST ---
+
+func FetchCurrentEpoch(restURL string) (int64, error) {
+	var r struct {
+		Epoch string `json:"epoch"`
+	}
+	if err := get(restURL+"/productscience/inference/inference/get_current_epoch", &r); err != nil {
+		return 0, err
+	}
+	return strconv.ParseInt(r.Epoch, 10, 64)
+}
+
+// EpochInfo contains epoch block data from the chain.
+type EpochInfo struct {
+	PocStartBlockHeight int64
+	EpochLength         int64
+	BlockHeight         int64
+}
+
+func FetchEpochInfo(restURL string) (*EpochInfo, error) {
+	var r struct {
+		LatestEpoch struct {
+			PocStartBlockHeight string `json:"poc_start_block_height"`
+		} `json:"latest_epoch"`
+		Params struct {
+			EpochParams struct {
+				EpochLength string `json:"epoch_length"`
+			} `json:"epoch_params"`
+		} `json:"params"`
+		BlockHeight string `json:"block_height"`
+	}
+	if err := get(restURL+"/productscience/inference/inference/epoch_info", &r); err != nil {
+		return nil, err
+	}
+	poc, err1 := strconv.ParseInt(r.LatestEpoch.PocStartBlockHeight, 10, 64)
+	el, err2  := strconv.ParseInt(r.Params.EpochParams.EpochLength, 10, 64)
+	bh, err3  := strconv.ParseInt(r.BlockHeight, 10, 64)
+	if err1 != nil || err2 != nil || err3 != nil {
+		return nil, fmt.Errorf("parse epoch_info: %v %v %v", err1, err2, err3)
+	}
+	return &EpochInfo{
+		PocStartBlockHeight: poc,
+		EpochLength:         el,
+		BlockHeight:         bh,
+	}, nil
+}
+
+// --- Epoch group data ---
+
+// ValidationWeight is a per-participant weight entry.
+type ValidationWeight struct {
+	MemberAddress string `json:"member_address"`
+	Weight        string `json:"weight"`
+}
+
+// EpochGroupData contains network-wide epoch weight data.
+type EpochGroupData struct {
+	TotalWeight       int64
+	EpochIndex        int64
+	ValidationWeights []ValidationWeight
+}
+
+func FetchEpochGroupData(restURL string) (*EpochGroupData, error) {
+	var r struct {
+		EpochGroupData struct {
+			TotalWeight       string             `json:"total_weight"`
+			EpochIndex        string             `json:"epoch_index"`
+			ValidationWeights []ValidationWeight `json:"validation_weights"`
+		} `json:"epoch_group_data"`
+	}
+	if err := get(restURL+"/productscience/inference/inference/current_epoch_group_data", &r); err != nil {
+		return nil, err
+	}
+	tw, _ := strconv.ParseInt(r.EpochGroupData.TotalWeight, 10, 64)
+	ei, _ := strconv.ParseInt(r.EpochGroupData.EpochIndex, 10, 64)
+	return &EpochGroupData{
+		TotalWeight:       tw,
+		EpochIndex:        ei,
+		ValidationWeights: r.EpochGroupData.ValidationWeights,
+	}, nil
+}
+
+// --- Epoch performance summary ---
+
+// EpochPerfSummary holds on-chain reward data for a completed epoch.
+type EpochPerfSummary struct {
+	RewardedGNK float64
+	Claimed     int
+}
+
+func FetchEpochPerfSummary(restURL, address string, epochNum int64) (*EpochPerfSummary, error) {
+	var r struct {
+		EpochPerformanceSummary struct {
+			RewardedCoins string `json:"rewarded_coins"`
+			Claimed       bool   `json:"claimed"`
+		} `json:"epochPerformanceSummary"`
+	}
+	url := fmt.Sprintf("%s/productscience/inference/inference/epoch_performance_summary/%d/%s", restURL, epochNum, address)
+	if err := get(url, &r); err != nil {
+		return nil, err
+	}
+	rc, err := strconv.ParseInt(r.EpochPerformanceSummary.RewardedCoins, 10, 64)
+	if err != nil {
+		return nil, fmt.Errorf("parse rewarded_coins: %w", err)
+	}
+	claimed := 0
+	if r.EpochPerformanceSummary.Claimed {
+		claimed = 1
+	}
+	return &EpochPerfSummary{RewardedGNK: float64(rc) / 1e9, Claimed: claimed}, nil
+}
+
+// --- Participant stats ---
+
+// ParticipantStats holds current-epoch stats for one participant.
+type ParticipantStats struct {
+	EpochsCompleted       int64
+	CoinBalance           int64
+	InferenceCount        int64
+	MissedRequests        int64
+	EarnedCoins           int64
+	ValidatedInferences   int64
+	InvalidatedInferences int64
+}
+
+type participantStatsResp struct {
+	Participant struct {
+		EpochsCompleted flexInt64 `json:"epochs_completed"`
+		CoinBalance     flexInt64 `json:"coin_balance"`
+		CurrentEpochStats struct {
+			InferenceCount        flexInt64 `json:"inference_count"`
+			MissedRequests        flexInt64 `json:"missed_requests"`
+			EarnedCoins           flexInt64 `json:"earned_coins"`
+			ValidatedInferences   flexInt64 `json:"validated_inferences"`
+			InvalidatedInferences flexInt64 `json:"invalidated_inferences"`
+		} `json:"current_epoch_stats"`
+	} `json:"participant"`
+}
+
+func FetchParticipantStats(restURL, address string) (*ParticipantStats, error) {
+	var r participantStatsResp
+	if err := get(restURL+"/productscience/inference/inference/participant/"+address, &r); err != nil {
+		return nil, err
+	}
+	p := r.Participant
+	return &ParticipantStats{
+		EpochsCompleted:       int64(p.EpochsCompleted),
+		CoinBalance:           int64(p.CoinBalance),
+		InferenceCount:        int64(p.CurrentEpochStats.InferenceCount),
+		MissedRequests:        int64(p.CurrentEpochStats.MissedRequests),
+		EarnedCoins:           int64(p.CurrentEpochStats.EarnedCoins),
+		ValidatedInferences:   int64(p.CurrentEpochStats.ValidatedInferences),
+		InvalidatedInferences: int64(p.CurrentEpochStats.InvalidatedInferences),
+	}, nil
+}
+
+// --- Bank balance ---
+
+func FetchWalletBalance(restURL, address string) (float64, error) {
+	var r struct {
+		Balances []struct {
+			Denom  string `json:"denom"`
+			Amount string `json:"amount"`
+		} `json:"balances"`
+	}
+	if err := get(restURL+"/cosmos/bank/v1beta1/balances/"+address, &r); err != nil {
+		return 0, err
+	}
+	for _, b := range r.Balances {
+		if b.Denom == "ngonka" {
+			n, err := strconv.ParseInt(b.Amount, 10, 64)
+			if err != nil {
+				return 0, err
+			}
+			return float64(n) / 1e9, nil
+		}
+	}
+	return 0, fmt.Errorf("ngonka balance not found")
+}
+
+// --- Node list (admin API) ---
+
+// NodeEntry represents a single node returned by the admin API.
+type NodeEntry struct {
+	Node struct {
+		ID       string `json:"id"`
+		Host     string `json:"host"`
+		PocPort  int    `json:"poc_port"`
+		Hardware []struct {
+			Type  string `json:"type"`
+			Count int    `json:"count"`
+		} `json:"hardware"`
+	} `json:"node"`
+	State struct {
+		CurrentStatus     string `json:"current_status"`
+		IntendedStatus    string `json:"intended_status"`
+		PocCurrentStatus  string `json:"poc_current_status"`
+		PocIntendedStatus string `json:"poc_intended_status"`
+		EpochMLNodes      map[string]struct {
+			PocWeight          *int64 `json:"poc_weight"`
+			TimeslotAllocation []bool `json:"timeslot_allocation"`
+		} `json:"epoch_ml_nodes"`
+	} `json:"state"`
+}
+
+func FetchNodes(adminURL string) ([]NodeEntry, error) {
+	var nodes []NodeEntry
+	err := get(adminURL+"/admin/v1/nodes", &nodes)
+	return nodes, err
+}
+
+// --- GPU stats ---
+
+// GPUStats contains aggregated GPU info for a node.
+type GPUStats struct {
+	Count   int
+	AvgUtil float64
+}
+
+func FetchGPUStats(host string, port int) GPUStats {
+	var r struct {
+		Devices []struct {
+			UtilizationPercent float64 `json:"utilization_percent"`
+		} `json:"devices"`
+	}
+	url := fmt.Sprintf("http://%s:%d/v3.0.8/api/v1/gpu/devices", host, port)
+	if err := get(url, &r); err != nil || len(r.Devices) == 0 {
+		return GPUStats{}
+	}
+	var total float64
+	for _, d := range r.Devices {
+		total += d.UtilizationPercent
+	}
+	return GPUStats{Count: len(r.Devices), AvgUtil: total / float64(len(r.Devices))}
+}
+
+// --- Participants (network-wide weights) ---
+
+// ParticipantEntry is one entry in the active participants list.
+type ParticipantEntry struct {
+	Seed struct {
+		Participant string `json:"participant"`
+	} `json:"seed"`
+	Weight  *float64 `json:"weight"`
+	MLNodes []struct {
+		MLNodes []struct {
+			NodeID    string   `json:"node_id"`
+			PocWeight *float64 `json:"poc_weight"`
+		} `json:"ml_nodes"`
+	} `json:"ml_nodes"`
+}
+
+func FetchNetworkParticipants(apiURL string) ([]ParticipantEntry, error) {
+	var r struct {
+		ActiveParticipants struct {
+			Participants []ParticipantEntry `json:"participants"`
+		} `json:"active_participants"`
+	}
+	if err := get(apiURL+"/v1/epochs/current/participants", &r); err != nil {
+		return nil, err
+	}
+	return r.ActiveParticipants.Participants, nil
+}
+
+// --- Pricing ---
+
+// PricingData holds current pricing configuration.
+type PricingData struct {
+	UnitOfComputePrice    *float64 `json:"unit_of_compute_price"`
+	DynamicPricingEnabled *bool    `json:"dynamic_pricing_enabled"`
+	Models []struct {
+		ID                     string   `json:"id"`
+		PricePerToken          *float64 `json:"price_per_token"`
+		UnitsOfComputePerToken *float64 `json:"units_of_compute_per_token"`
+	} `json:"models"`
+}
+
+func FetchPricing(apiURL string) (*PricingData, error) {
+	var r PricingData
+	err := get(apiURL+"/v1/pricing", &r)
+	return &r, err
+}
+
+// --- Models ---
+
+// ModelData holds model definitions from the API.
+type ModelData struct {
+	Models []struct {
+		ID                  string   `json:"id"`
+		VRAM                *float64 `json:"v_ram"`
+		ThroughputPerNonce  *float64 `json:"throughput_per_nonce"`
+		ValidationThreshold *struct {
+			Value    float64 `json:"value"`
+			Exponent int     `json:"exponent"`
+		} `json:"validation_threshold"`
+	} `json:"models"`
+}
+
+func FetchModels(apiURL string) (*ModelData, error) {
+	var r ModelData
+	err := get(apiURL+"/v1/models", &r)
+	return &r, err
+}
