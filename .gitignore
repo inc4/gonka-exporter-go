@@ -1,0 +1,15 @@
+# Compiled binaries
+exporter
+gonka-exporter
+*.exe
+
+# Environment files
+.env
+
+# Data files
+*.json
+!package.json
+
+# IDE
+.idea/
+.vscode/
