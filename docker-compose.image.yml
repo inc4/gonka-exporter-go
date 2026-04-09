@@ -51,4 +51,4 @@ volumes:
 networks:
   gonka-network:
     external: true
-    name: ${GONKA_NETWORK:-deploy_default}
+    name: ${GONKA_NETWORK:-gonka-node_default}
