@@ -764,7 +764,6 @@ func (c *Collector) collectTokenomics() {
 	metrics.TokenomicsTotalSubsidies.Set(float64(tok.TotalSubsidies))
 	metrics.TokenomicsTotalRefunded.Set(float64(tok.TotalRefunded))
 	metrics.TokenomicsTotalBurned.Set(float64(tok.TotalBurned))
-	metrics.TokenomicsTopRewardStart.Set(float64(tok.TopRewardStart))
 }
 
 // --- PoC v2 ---

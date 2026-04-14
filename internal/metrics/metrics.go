@@ -156,7 +156,6 @@ var (
 	TokenomicsTotalSubsidies = gauge("gonka_tokenomics_total_subsidies",  "Total subsidies issued (ngonka)")
 	TokenomicsTotalRefunded  = gauge("gonka_tokenomics_total_refunded",   "Total amount refunded (ngonka)")
 	TokenomicsTotalBurned    = gauge("gonka_tokenomics_total_burned",     "Total amount burned (ngonka)")
-	TokenomicsTopRewardStart = gauge("gonka_tokenomics_top_reward_start", "Top reward start epoch index")
 )
 
 

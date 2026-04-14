@@ -676,7 +676,6 @@ type TokenomicsData struct {
 	TotalSubsidies uint64
 	TotalRefunded  uint64
 	TotalBurned    uint64
-	TopRewardStart int64
 }
 
 // FetchTokenomics returns tokenomics data from the chain REST endpoint.
@@ -687,7 +686,6 @@ func FetchTokenomics(restURL string) (*TokenomicsData, error) {
 			TotalSubsidies flexInt64 `json:"total_subsidies"`
 			TotalRefunded  flexInt64 `json:"total_refunded"`
 			TotalBurned    flexInt64 `json:"total_burned"`
-			TopRewardStart flexInt64 `json:"top_reward_start"`
 		} `json:"tokenomics_data"`
 	}
 	if err := get(restURL+"/productscience/inference/inference/tokenomics_data", &r); err != nil {
@@ -699,7 +697,6 @@ func FetchTokenomics(restURL string) (*TokenomicsData, error) {
 		TotalSubsidies: uint64(td.TotalSubsidies),
 		TotalRefunded:  uint64(td.TotalRefunded),
 		TotalBurned:    uint64(td.TotalBurned),
-		TopRewardStart: int64(td.TopRewardStart),
 	}, nil
 }
 
