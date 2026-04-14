@@ -121,6 +121,51 @@ var (
 	EpochEstimated   = gaugeVec("gonka_epoch_estimated_reward_gonka", "Estimated GNK reward for epoch N (weight × emission/total_weight)", "participant", "epoch")
 )
 
+// Stats — network-wide inference statistics
+var (
+	StatsAiTokens        = gauge("gonka_stats_ai_tokens_total",     "Total AI tokens processed network-wide (cumulative)")
+	StatsInferences      = gauge("gonka_stats_inferences_total",    "Total inferences processed network-wide (cumulative)")
+	StatsActualCost      = gauge("gonka_stats_actual_cost_total",   "Total actual inference cost network-wide (coins, cumulative)")
+	StatsModelAiTokens   = gaugeVec("gonka_stats_model_ai_tokens",  "AI tokens processed per model (cumulative)", "model_id")
+	StatsModelInferences = gaugeVec("gonka_stats_model_inferences", "Inferences processed per model (cumulative)", "model_id")
+)
+
+// Bridge — queue status for the Gonka bridge
+var (
+	BridgePendingBlocks   = gauge("gonka_bridge_pending_blocks",        "Bridge pending block count")
+	BridgePendingReceipts = gauge("gonka_bridge_pending_receipts",      "Bridge pending receipt count")
+	BridgeReadyToProcess  = gauge("gonka_bridge_ready_to_process",      "Bridge ready to process (1=yes 0=no)")
+	BridgeEarliestBlock   = gauge("gonka_bridge_earliest_block_number", "Bridge earliest pending block number")
+	BridgeLatestBlock     = gauge("gonka_bridge_latest_block_number",   "Bridge latest pending block number")
+)
+
+// Node managers — running/healthy state per ML node manager
+var (
+	NodeManagerRunning = gaugeVec("gonka_node_manager_running", "ML node manager running (1=yes 0=no)", "participant", "node_id", "host", "manager")
+	NodeManagerHealthy = gaugeVec("gonka_node_manager_healthy", "ML node manager healthy (1=yes 0=no)", "participant", "node_id", "host", "manager")
+)
+
+// GPU driver info — version in labels, value always 1
+var (
+	NodeGPUDriverInfo = gaugeVec("gonka_node_gpu_driver_info", "GPU driver info (value=1, version in labels)", "participant", "node_id", "host", "driver_version", "cuda_version")
+)
+
+// Tokenomics — chain-wide token flow counters
+var (
+	TokenomicsTotalFees      = gauge("gonka_tokenomics_total_fees",       "Total fees collected (ngonka)")
+	TokenomicsTotalSubsidies = gauge("gonka_tokenomics_total_subsidies",  "Total subsidies issued (ngonka)")
+	TokenomicsTotalRefunded  = gauge("gonka_tokenomics_total_refunded",   "Total amount refunded (ngonka)")
+	TokenomicsTotalBurned    = gauge("gonka_tokenomics_total_burned",     "Total amount burned (ngonka)")
+	TokenomicsTopRewardStart = gauge("gonka_tokenomics_top_reward_start", "Top reward start epoch index")
+)
+
+
+// PoC v2 — proof-of-compute artifact and weight data
+var (
+	PoCv2ArtifactCount = gaugeVec("gonka_poc_v2_artifact_count", "PoC v2 artifact count from store commit", "participant")
+	PoCv2NodeWeight    = gaugeVec("gonka_poc_v2_node_weight",     "PoC v2 per-node weight distribution",    "participant", "node_id")
+)
+
 func gauge(name, help string) prometheus.Gauge {
 	g := prometheus.NewGauge(prometheus.GaugeOpts{Name: name, Help: help})
 	prometheus.MustRegister(g)

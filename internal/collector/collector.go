@@ -62,6 +62,10 @@ func (c *Collector) Collect() {
 	c.collectPricingAndModels()
 	c.collectParticipant()
 	c.collectNodes()
+	c.collectStats()
+	c.collectBridge()
+	c.collectTokenomics()
+	c.collectPoCv2()
 }
 
 // --- Chain / block ---
@@ -564,8 +568,37 @@ func (c *Collector) collectNodes() {
 			} else {
 				metrics.NodeDiskAvailableGB.WithLabelValues(addr, nodeID, host).Set(diskGB)
 			}
+
+			// GPU driver info
+			if drvInfo, drvErr := fetcher.FetchGPUDriverInfo(host, ni.PocPort); drvErr != nil {
+				slog.Debug("gpu driver info unavailable", "node", nodeID, "err", drvErr)
+			} else {
+				metrics.NodeGPUDriverInfo.WithLabelValues(addr, nodeID, host, drvInfo.DriverVersion, drvInfo.CudaDriverVersion).Set(1)
+			}
+
+			// ML node manager health
+			if health, healthErr := fetcher.FetchMLNodeHealth(host, ni.PocPort); healthErr != nil {
+				slog.Debug("ml node health unavailable", "node", nodeID, "err", healthErr)
+			} else {
+				setManagerMetric(addr, nodeID, host, "pow", health.ManagerPow)
+				setManagerMetric(addr, nodeID, host, "inference", health.ManagerInference)
+				setManagerMetric(addr, nodeID, host, "train", health.ManagerTrain)
+			}
 		}
 	}
+}
+
+func setManagerMetric(addr, nodeID, host, manager string, s fetcher.MLNodeManagerStatus) {
+	running := 0.0
+	if s.Running {
+		running = 1.0
+	}
+	healthy := 0.0
+	if s.Healthy {
+		healthy = 1.0
+	}
+	metrics.NodeManagerRunning.WithLabelValues(addr, nodeID, host, manager).Set(running)
+	metrics.NodeManagerHealthy.WithLabelValues(addr, nodeID, host, manager).Set(healthy)
 }
 
 // --- Restore metrics from history on startup ---
@@ -666,4 +699,100 @@ func copyMap(m map[string]int64) map[string]int64 {
 		out[k] = v
 	}
 	return out
+}
+
+// --- Stats ---
+
+func (c *Collector) collectStats() {
+	// Per-model stats
+	models, err := fetcher.FetchStatsModels(c.cfg.APIURL)
+	if err != nil {
+		slog.Debug("stats models unavailable", "err", err)
+	} else {
+		for _, m := range models {
+			if m.Model == "" {
+				continue
+			}
+			metrics.StatsModelAiTokens.WithLabelValues(m.Model).Set(float64(m.AiTokens))
+			metrics.StatsModelInferences.WithLabelValues(m.Model).Set(float64(m.Inferences))
+		}
+	}
+
+	// Network-wide summary
+	summary, err := fetcher.FetchStatsSummary(c.cfg.APIURL)
+	if err != nil {
+		slog.Debug("stats summary unavailable", "err", err)
+		return
+	}
+	metrics.StatsAiTokens.Set(float64(summary.AiTokens))
+	metrics.StatsInferences.Set(float64(summary.Inferences))
+	metrics.StatsActualCost.Set(float64(summary.ActualCost))
+}
+
+// --- Bridge ---
+
+func (c *Collector) collectBridge() {
+	status, err := fetcher.FetchBridgeStatus(c.cfg.APIURL)
+	if err != nil {
+		slog.Debug("bridge status unavailable", "err", err)
+		return
+	}
+	metrics.BridgePendingBlocks.Set(float64(status.PendingBlocks))
+	metrics.BridgePendingReceipts.Set(float64(status.PendingReceipts))
+	ready := 0.0
+	if status.ReadyToProcess {
+		ready = 1.0
+	}
+	metrics.BridgeReadyToProcess.Set(ready)
+	if status.EarliestBlock > 0 {
+		metrics.BridgeEarliestBlock.Set(float64(status.EarliestBlock))
+	}
+	if status.LatestBlock > 0 {
+		metrics.BridgeLatestBlock.Set(float64(status.LatestBlock))
+	}
+}
+
+// --- Tokenomics ---
+
+func (c *Collector) collectTokenomics() {
+	tok, err := fetcher.FetchTokenomics(c.cfg.NodeRESTURL)
+	if err != nil {
+		slog.Debug("tokenomics unavailable", "err", err)
+		return
+	}
+	metrics.TokenomicsTotalFees.Set(float64(tok.TotalFees))
+	metrics.TokenomicsTotalSubsidies.Set(float64(tok.TotalSubsidies))
+	metrics.TokenomicsTotalRefunded.Set(float64(tok.TotalRefunded))
+	metrics.TokenomicsTotalBurned.Set(float64(tok.TotalBurned))
+	metrics.TokenomicsTopRewardStart.Set(float64(tok.TopRewardStart))
+}
+
+// --- PoC v2 ---
+
+func (c *Collector) collectPoCv2() {
+	addr := c.cfg.Participant
+	if addr == "" || c.st.PocStartBlockHeight == 0 {
+		return
+	}
+
+	// Artifact count
+	commit, err := fetcher.FetchPoCv2Commit(c.cfg.NodeRESTURL, c.st.PocStartBlockHeight, addr)
+	if err != nil {
+		slog.Debug("poc_v2 commit unavailable", "err", err)
+	} else {
+		metrics.PoCv2ArtifactCount.WithLabelValues(addr).Set(float64(commit.Count))
+	}
+
+	// Per-node weight distribution
+	weights, err := fetcher.FetchMLNodeWeightDist(c.cfg.NodeRESTURL, c.st.PocStartBlockHeight, addr)
+	if err != nil {
+		slog.Debug("poc_v2 node weight dist unavailable", "err", err)
+		return
+	}
+	for _, w := range weights {
+		if w.NodeID == "" {
+			continue
+		}
+		metrics.PoCv2NodeWeight.WithLabelValues(addr, w.NodeID).Set(float64(w.Weight))
+	}
 }

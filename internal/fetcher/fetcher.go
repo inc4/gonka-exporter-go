@@ -515,6 +515,242 @@ var dkgPhaseNames = map[string]int32{
 	"DKG_PHASE_SIGNED":     5,
 }
 
+// --- Stats API ---
+
+// StatsSummaryData holds network-wide inference statistics.
+type StatsSummaryData struct {
+	AiTokens   int64
+	Inferences int32
+	ActualCost int64
+}
+
+// FetchStatsSummary returns aggregated network stats from /v1/stats/summary/time.
+func FetchStatsSummary(apiURL string) (*StatsSummaryData, error) {
+	var r struct {
+		AiTokens             int64 `json:"ai_tokens"`
+		Inferences           int32 `json:"inferences"`
+		ActualInferencesCost int64 `json:"actual_inferences_cost"`
+	}
+	if err := get(apiURL+"/v1/stats/summary/time", &r); err != nil {
+		return nil, err
+	}
+	return &StatsSummaryData{AiTokens: r.AiTokens, Inferences: r.Inferences, ActualCost: r.ActualInferencesCost}, nil
+}
+
+// StatsModelEntry holds per-model inference statistics.
+type StatsModelEntry struct {
+	Model      string
+	AiTokens   int64
+	Inferences int32
+}
+
+// FetchStatsModels returns per-model stats from /v1/stats/models.
+func FetchStatsModels(apiURL string) ([]StatsModelEntry, error) {
+	var r struct {
+		StatsModels []struct {
+			Model      string `json:"model"`
+			AiTokens   int64  `json:"ai_tokens"`
+			Inferences int32  `json:"inferences"`
+		} `json:"stats_models"`
+	}
+	if err := get(apiURL+"/v1/stats/models", &r); err != nil {
+		return nil, err
+	}
+	out := make([]StatsModelEntry, len(r.StatsModels))
+	for i, m := range r.StatsModels {
+		out[i] = StatsModelEntry{Model: m.Model, AiTokens: m.AiTokens, Inferences: m.Inferences}
+	}
+	return out, nil
+}
+
+// --- Bridge ---
+
+// BridgeStatusData holds bridge queue status.
+type BridgeStatusData struct {
+	PendingBlocks   int
+	PendingReceipts int
+	ReadyToProcess  bool
+	EarliestBlock   uint64
+	LatestBlock     uint64
+}
+
+// FetchBridgeStatus returns bridge queue status from /v1/bridge/status.
+func FetchBridgeStatus(apiURL string) (*BridgeStatusData, error) {
+	var r struct {
+		PendingBlocksCount   int    `json:"pendingBlocksCount"`
+		PendingReceiptsCount int    `json:"pendingReceiptsCount"`
+		EarliestBlockNumber  uint64 `json:"earliestBlockNumber"`
+		LatestBlockNumber    uint64 `json:"latestBlockNumber"`
+		ReadyToProcess       bool   `json:"readyToProcess"`
+	}
+	if err := get(apiURL+"/v1/bridge/status", &r); err != nil {
+		return nil, err
+	}
+	return &BridgeStatusData{
+		PendingBlocks:   r.PendingBlocksCount,
+		PendingReceipts: r.PendingReceiptsCount,
+		ReadyToProcess:  r.ReadyToProcess,
+		EarliestBlock:   r.EarliestBlockNumber,
+		LatestBlock:     r.LatestBlockNumber,
+	}, nil
+}
+
+// --- ML node health ---
+
+// MLNodeManagerStatus holds running/healthy status for one manager.
+type MLNodeManagerStatus struct {
+	Running bool
+	Healthy bool
+}
+
+// MLNodeHealthData holds manager health for all ML node managers.
+type MLNodeHealthData struct {
+	ManagerPow       MLNodeManagerStatus
+	ManagerInference MLNodeManagerStatus
+	ManagerTrain     MLNodeManagerStatus
+}
+
+// FetchMLNodeHealth returns manager health. Tries /health first (root endpoint),
+// then /v3.0.8/api/v1/health as fallback.
+func FetchMLNodeHealth(host string, port int) (*MLNodeHealthData, error) {
+	var r struct {
+		Managers struct {
+			Pow struct {
+				Running bool `json:"running"`
+				Healthy bool `json:"healthy"`
+			} `json:"pow"`
+			Inference struct {
+				Running bool `json:"running"`
+				Healthy bool `json:"healthy"`
+			} `json:"inference"`
+			Train struct {
+				Running bool `json:"running"`
+				Healthy bool `json:"healthy"`
+			} `json:"train"`
+		} `json:"managers"`
+	}
+	url := fmt.Sprintf("http://%s:%d/health", host, port)
+	if err := get(url, &r); err != nil {
+		// Fallback: versioned path
+		url = fmt.Sprintf("http://%s:%d/v3.0.8/api/v1/health", host, port)
+		if err2 := get(url, &r); err2 != nil {
+			return nil, err2
+		}
+	}
+	return &MLNodeHealthData{
+		ManagerPow:       MLNodeManagerStatus{Running: r.Managers.Pow.Running, Healthy: r.Managers.Pow.Healthy},
+		ManagerInference: MLNodeManagerStatus{Running: r.Managers.Inference.Running, Healthy: r.Managers.Inference.Healthy},
+		ManagerTrain:     MLNodeManagerStatus{Running: r.Managers.Train.Running, Healthy: r.Managers.Train.Healthy},
+	}, nil
+}
+
+// --- GPU driver info ---
+
+// GPUDriverData holds GPU driver and CUDA version strings.
+type GPUDriverData struct {
+	DriverVersion     string
+	CudaDriverVersion string
+}
+
+// FetchGPUDriverInfo returns GPU driver info from /v3.0.8/api/v1/gpu/driver.
+func FetchGPUDriverInfo(host string, port int) (*GPUDriverData, error) {
+	var r struct {
+		DriverVersion     string `json:"driver_version"`
+		CudaDriverVersion string `json:"cuda_driver_version"`
+	}
+	url := fmt.Sprintf("http://%s:%d/v3.0.8/api/v1/gpu/driver", host, port)
+	if err := get(url, &r); err != nil {
+		return nil, err
+	}
+	if r.DriverVersion == "" {
+		return nil, fmt.Errorf("empty driver version")
+	}
+	return &GPUDriverData{DriverVersion: r.DriverVersion, CudaDriverVersion: r.CudaDriverVersion}, nil
+}
+
+// --- Tokenomics ---
+
+// TokenomicsData holds chain-wide tokenomics counters.
+type TokenomicsData struct {
+	TotalFees      uint64
+	TotalSubsidies uint64
+	TotalRefunded  uint64
+	TotalBurned    uint64
+	TopRewardStart int64
+}
+
+// FetchTokenomics returns tokenomics data from the chain REST endpoint.
+func FetchTokenomics(restURL string) (*TokenomicsData, error) {
+	var r struct {
+		TokenomicsData struct {
+			TotalFees      flexInt64 `json:"total_fees"`
+			TotalSubsidies flexInt64 `json:"total_subsidies"`
+			TotalRefunded  flexInt64 `json:"total_refunded"`
+			TotalBurned    flexInt64 `json:"total_burned"`
+			TopRewardStart flexInt64 `json:"top_reward_start"`
+		} `json:"tokenomics_data"`
+	}
+	if err := get(restURL+"/productscience/inference/inference/tokenomics_data", &r); err != nil {
+		return nil, err
+	}
+	td := r.TokenomicsData
+	return &TokenomicsData{
+		TotalFees:      uint64(td.TotalFees),
+		TotalSubsidies: uint64(td.TotalSubsidies),
+		TotalRefunded:  uint64(td.TotalRefunded),
+		TotalBurned:    uint64(td.TotalBurned),
+		TopRewardStart: int64(td.TopRewardStart),
+	}, nil
+}
+
+// --- PoC v2 ---
+
+// PoCv2CommitData holds the artifact commit count for a participant.
+type PoCv2CommitData struct {
+	Count uint32
+}
+
+// FetchPoCv2Commit returns the PoC v2 store commit for a participant at a given PoC stage start block.
+func FetchPoCv2Commit(restURL string, pocStartBlock int64, address string) (*PoCv2CommitData, error) {
+	var r struct {
+		PoCV2StoreCommit struct {
+			Count flexInt64 `json:"count"`
+		} `json:"poc_v2_store_commit"`
+	}
+	url := fmt.Sprintf("%s/productscience/inference/inference/poc_v2_store_commit/%d/%s", restURL, pocStartBlock, address)
+	if err := get(url, &r); err != nil {
+		return nil, err
+	}
+	return &PoCv2CommitData{Count: uint32(r.PoCV2StoreCommit.Count)}, nil
+}
+
+// MLNodeWeightEntry holds per-node weight from MLNode weight distribution.
+type MLNodeWeightEntry struct {
+	NodeID string
+	Weight uint32
+}
+
+// FetchMLNodeWeightDist returns the per-node weight distribution for a participant at a given PoC stage start block.
+func FetchMLNodeWeightDist(restURL string, pocStartBlock int64, address string) ([]MLNodeWeightEntry, error) {
+	var r struct {
+		MLNodeWeightDistribution struct {
+			Weights []struct {
+				NodeID string    `json:"node_id"`
+				Weight flexInt64 `json:"weight"`
+			} `json:"weights"`
+		} `json:"mlnode_weight_distribution"`
+	}
+	url := fmt.Sprintf("%s/productscience/inference/inference/mlnode_weight_distribution/%d/%s", restURL, pocStartBlock, address)
+	if err := get(url, &r); err != nil {
+		return nil, err
+	}
+	out := make([]MLNodeWeightEntry, len(r.MLNodeWeightDistribution.Weights))
+	for i, w := range r.MLNodeWeightDistribution.Weights {
+		out[i] = MLNodeWeightEntry{NodeID: w.NodeID, Weight: uint32(w.Weight)}
+	}
+	return out, nil
+}
+
 // FetchBLSEpoch fetches BLS DKG phase data for the given epoch ID from the public API.
 func FetchBLSEpoch(apiURL string, epochID int64) (*BLSEpochData, error) {
 	var r struct {
