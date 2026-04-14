@@ -67,8 +67,10 @@ type EpochSnapshot struct {
 	Claimed               *int             `json:"claimed,omitempty"`
 }
 
-// History is the full epoch history map (epoch string → snapshot).
-type History = map[string]*EpochSnapshot
+// History maps participant address → epoch string → snapshot.
+// This allows a single exporter to retain epoch history across participant
+// address changes (e.g. when a node operator receives a new validator address).
+type History = map[string]map[string]*EpochSnapshot
 
 func LoadState(path string) EpochState {
 	data, err := os.ReadFile(path)
@@ -100,31 +102,73 @@ func SaveState(path string, s EpochState) {
 	}
 }
 
+// LoadHistory reads the history file and returns a History map.
+// It transparently migrates the old flat format (map[epoch]*EpochSnapshot)
+// to the new nested format (map[participant]map[epoch]*EpochSnapshot).
 func LoadHistory(path string) History {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return make(History)
 	}
+
+	// Try new nested format first.
+	// New format keys are participant addresses (non-numeric strings).
 	var h History
-	if err := json.Unmarshal(data, &h); err != nil {
+	if err := json.Unmarshal(data, &h); err == nil && len(h) > 0 {
+		isNew := true
+		for k := range h {
+			if _, numErr := strconv.Atoi(k); numErr == nil {
+				isNew = false
+				break
+			}
+		}
+		if isNew {
+			total := 0
+			for _, epochs := range h {
+				total += len(epochs)
+			}
+			slog.Info("loaded epoch history", "participants", len(h), "total_epochs", total, "path", path)
+			return h
+		}
+	}
+
+	// Old flat format: map[epoch]*EpochSnapshot — migrate by grouping on snap.Participant.
+	var oldH map[string]*EpochSnapshot
+	if err := json.Unmarshal(data, &oldH); err != nil {
 		slog.Warn("could not parse epoch history", "path", path, "err", err)
 		return make(History)
 	}
-	slog.Info("loaded epoch history", "epochs", len(h), "path", path)
+	h = make(History)
+	for epochStr, snap := range oldH {
+		p := snap.Participant
+		if p == "" {
+			continue
+		}
+		if h[p] == nil {
+			h[p] = make(map[string]*EpochSnapshot)
+		}
+		h[p][epochStr] = snap
+	}
+	slog.Info("migrated epoch history from old format", "participants", len(h), "path", path)
 	return h
 }
 
+// SaveHistory persists the history map, pruning each participant's epochs
+// independently to maxEntries oldest entries.
 func SaveHistory(path string, h History, maxEntries int) {
-	if len(h) > maxEntries {
-		keys := make([]int, 0, len(h))
-		for k := range h {
+	for _, epochs := range h {
+		if len(epochs) <= maxEntries {
+			continue
+		}
+		keys := make([]int, 0, len(epochs))
+		for k := range epochs {
 			if n, err := strconv.Atoi(k); err == nil {
 				keys = append(keys, n)
 			}
 		}
 		sort.Ints(keys)
 		for _, k := range keys[:len(keys)-maxEntries] {
-			delete(h, fmt.Sprintf("%d", k))
+			delete(epochs, fmt.Sprintf("%d", k))
 		}
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {

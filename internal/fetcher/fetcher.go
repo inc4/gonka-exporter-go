@@ -175,14 +175,16 @@ func FetchEpochInfo(restURL string) (*EpochInfo, error) {
 
 // ValidationWeight is a per-participant weight entry.
 type ValidationWeight struct {
-	MemberAddress string `json:"member_address"`
-	Weight        string `json:"weight"`
+	MemberAddress string    `json:"member_address"`
+	Weight        string    `json:"weight"`
+	Reputation    flexInt64 `json:"reputation"`
 }
 
 // EpochGroupData contains network-wide epoch weight data.
 type EpochGroupData struct {
 	TotalWeight       int64
 	EpochIndex        int64
+	NumberOfRequests  int64
 	ValidationWeights []ValidationWeight
 }
 
@@ -191,6 +193,7 @@ func FetchEpochGroupData(restURL string) (*EpochGroupData, error) {
 		EpochGroupData struct {
 			TotalWeight       string             `json:"total_weight"`
 			EpochIndex        string             `json:"epoch_index"`
+			NumberOfRequests  flexInt64          `json:"number_of_requests"`
 			ValidationWeights []ValidationWeight `json:"validation_weights"`
 		} `json:"epoch_group_data"`
 	}
@@ -202,6 +205,7 @@ func FetchEpochGroupData(restURL string) (*EpochGroupData, error) {
 	return &EpochGroupData{
 		TotalWeight:       tw,
 		EpochIndex:        ei,
+		NumberOfRequests:  int64(r.EpochGroupData.NumberOfRequests),
 		ValidationWeights: r.EpochGroupData.ValidationWeights,
 	}, nil
 }
@@ -240,25 +244,33 @@ func FetchEpochPerfSummary(restURL, address string, epochNum int64) (*EpochPerfS
 
 // ParticipantStats holds current-epoch stats for one participant.
 type ParticipantStats struct {
-	EpochsCompleted       int64
-	CoinBalance           int64
-	InferenceCount        int64
-	MissedRequests        int64
-	EarnedCoins           int64
-	ValidatedInferences   int64
-	InvalidatedInferences int64
+	EpochsCompleted              int64
+	CoinBalance                  int64
+	InferenceCount               int64
+	MissedRequests               int64
+	EarnedCoins                  int64
+	ValidatedInferences          int64
+	InvalidatedInferences        int64
+	Status                       string // "ACTIVE", "INACTIVE", "INVALID", "UNCONFIRMED", "UNSPECIFIED"
+	ConsecutiveInvalidInferences int64
+	BurnedCoins                  int64
+	RewardedCoins                int64
 }
 
 type participantStatsResp struct {
 	Participant struct {
-		EpochsCompleted flexInt64 `json:"epochs_completed"`
-		CoinBalance     flexInt64 `json:"coin_balance"`
-		CurrentEpochStats struct {
+		EpochsCompleted              flexInt64 `json:"epochs_completed"`
+		CoinBalance                  flexInt64 `json:"coin_balance"`
+		Status                       string    `json:"status"`
+		ConsecutiveInvalidInferences flexInt64 `json:"consecutive_invalid_inferences"`
+		CurrentEpochStats            struct {
 			InferenceCount        flexInt64 `json:"inference_count"`
 			MissedRequests        flexInt64 `json:"missed_requests"`
 			EarnedCoins           flexInt64 `json:"earned_coins"`
 			ValidatedInferences   flexInt64 `json:"validated_inferences"`
 			InvalidatedInferences flexInt64 `json:"invalidated_inferences"`
+			BurnedCoins           flexInt64 `json:"burned_coins"`
+			RewardedCoins         flexInt64 `json:"rewarded_coins"`
 		} `json:"current_epoch_stats"`
 	} `json:"participant"`
 }
@@ -270,13 +282,17 @@ func FetchParticipantStats(restURL, address string) (*ParticipantStats, error) {
 	}
 	p := r.Participant
 	return &ParticipantStats{
-		EpochsCompleted:       int64(p.EpochsCompleted),
-		CoinBalance:           int64(p.CoinBalance),
-		InferenceCount:        int64(p.CurrentEpochStats.InferenceCount),
-		MissedRequests:        int64(p.CurrentEpochStats.MissedRequests),
-		EarnedCoins:           int64(p.CurrentEpochStats.EarnedCoins),
-		ValidatedInferences:   int64(p.CurrentEpochStats.ValidatedInferences),
-		InvalidatedInferences: int64(p.CurrentEpochStats.InvalidatedInferences),
+		EpochsCompleted:              int64(p.EpochsCompleted),
+		CoinBalance:                  int64(p.CoinBalance),
+		InferenceCount:               int64(p.CurrentEpochStats.InferenceCount),
+		MissedRequests:               int64(p.CurrentEpochStats.MissedRequests),
+		EarnedCoins:                  int64(p.CurrentEpochStats.EarnedCoins),
+		ValidatedInferences:          int64(p.CurrentEpochStats.ValidatedInferences),
+		InvalidatedInferences:        int64(p.CurrentEpochStats.InvalidatedInferences),
+		Status:                       p.Status,
+		ConsecutiveInvalidInferences: int64(p.ConsecutiveInvalidInferences),
+		BurnedCoins:                  int64(p.CurrentEpochStats.BurnedCoins),
+		RewardedCoins:                int64(p.CurrentEpochStats.RewardedCoins),
 	}, nil
 }
 
@@ -337,16 +353,34 @@ func FetchNodes(adminURL string) ([]NodeEntry, error) {
 
 // --- GPU stats ---
 
+// GPUDevice holds per-device GPU metrics.
+type GPUDevice struct {
+	Index              int
+	UtilizationPercent float64
+	TemperatureC       *float64
+	TotalMemoryMB      *int64
+	FreeMemoryMB       *int64
+	UsedMemoryMB       *int64
+	IsAvailable        bool
+}
+
 // GPUStats contains aggregated GPU info for a node.
 type GPUStats struct {
 	Count   int
 	AvgUtil float64
+	Devices []GPUDevice
 }
 
 func FetchGPUStats(host string, port int) GPUStats {
 	var r struct {
 		Devices []struct {
-			UtilizationPercent float64 `json:"utilization_percent"`
+			Index              int      `json:"index"`
+			UtilizationPercent float64  `json:"utilization_percent"`
+			TemperatureC       *float64 `json:"temperature_c"`
+			TotalMemoryMB      *int64   `json:"total_memory_mb"`
+			FreeMemoryMB       *int64   `json:"free_memory_mb"`
+			UsedMemoryMB       *int64   `json:"used_memory_mb"`
+			IsAvailable        bool     `json:"is_available"`
 		} `json:"devices"`
 	}
 	url := fmt.Sprintf("http://%s:%d/v3.0.8/api/v1/gpu/devices", host, port)
@@ -354,10 +388,44 @@ func FetchGPUStats(host string, port int) GPUStats {
 		return GPUStats{}
 	}
 	var total float64
-	for _, d := range r.Devices {
+	devices := make([]GPUDevice, len(r.Devices))
+	for i, d := range r.Devices {
 		total += d.UtilizationPercent
+		devices[i] = GPUDevice{
+			Index:              d.Index,
+			UtilizationPercent: d.UtilizationPercent,
+			TemperatureC:       d.TemperatureC,
+			TotalMemoryMB:      d.TotalMemoryMB,
+			FreeMemoryMB:       d.FreeMemoryMB,
+			UsedMemoryMB:       d.UsedMemoryMB,
+			IsAvailable:        d.IsAvailable,
+		}
 	}
-	return GPUStats{Count: len(r.Devices), AvgUtil: total / float64(len(r.Devices))}
+	return GPUStats{Count: len(r.Devices), AvgUtil: total / float64(len(r.Devices)), Devices: devices}
+}
+
+// FetchMLNodeState returns the current service state string ("POW", "INFERENCE", "TRAIN", "STOPPED").
+func FetchMLNodeState(host string, port int) (string, error) {
+	var r struct {
+		State string `json:"state"`
+	}
+	url := fmt.Sprintf("http://%s:%d/v3.0.8/api/v1/state", host, port)
+	if err := get(url, &r); err != nil {
+		return "", err
+	}
+	return r.State, nil
+}
+
+// FetchMLNodeDiskSpaceGB returns available disk space in GB for the model cache.
+func FetchMLNodeDiskSpaceGB(host string, port int) (float64, error) {
+	var r struct {
+		AvailableGB float64 `json:"available_gb"`
+	}
+	url := fmt.Sprintf("http://%s:%d/v3.0.8/api/v1/models/space", host, port)
+	if err := get(url, &r); err != nil {
+		return 0, err
+	}
+	return r.AvailableGB, nil
 }
 
 // --- Participants (network-wide weights) ---
@@ -398,6 +466,8 @@ type PricingData struct {
 		ID                     string   `json:"id"`
 		PricePerToken          *float64 `json:"price_per_token"`
 		UnitsOfComputePerToken *float64 `json:"units_of_compute_per_token"`
+		Utilization            *float64 `json:"utilization"`
+		Capacity               *int64   `json:"capacity"`
 	} `json:"models"`
 }
 
@@ -426,4 +496,50 @@ func FetchModels(apiURL string) (*ModelData, error) {
 	var r ModelData
 	err := get(apiURL+"/v1/models", &r)
 	return &r, err
+}
+
+// BLSEpochData holds BLS DKG phase information for an epoch.
+type BLSEpochData struct {
+	DKGPhase                    int32
+	DealingPhaseDeadlineBlock   int64
+	VerifyingPhaseDeadlineBlock int64
+}
+
+// dkgPhaseNames maps DKG phase string names to numeric values.
+var dkgPhaseNames = map[string]int32{
+	"DKG_PHASE_UNDEFINED":  0,
+	"DKG_PHASE_DEALING":    1,
+	"DKG_PHASE_VERIFYING":  2,
+	"DKG_PHASE_COMPLETED":  3,
+	"DKG_PHASE_FAILED":     4,
+	"DKG_PHASE_SIGNED":     5,
+}
+
+// FetchBLSEpoch fetches BLS DKG phase data for the given epoch ID from the public API.
+func FetchBLSEpoch(apiURL string, epochID int64) (*BLSEpochData, error) {
+	var r struct {
+		EpochData struct {
+			DKGPhase                    interface{} `json:"dkg_phase"`
+			DealingPhaseDeadlineBlock   flexInt64   `json:"dealing_phase_deadline_block"`
+			VerifyingPhaseDeadlineBlock flexInt64   `json:"verifying_phase_deadline_block"`
+		} `json:"epoch_data"`
+	}
+	url := fmt.Sprintf("%s/v1/bls/epoch/%d", apiURL, epochID)
+	if err := get(url, &r); err != nil {
+		return nil, err
+	}
+	var phase int32
+	switch v := r.EpochData.DKGPhase.(type) {
+	case float64:
+		phase = int32(v)
+	case string:
+		if n, ok := dkgPhaseNames[v]; ok {
+			phase = n
+		}
+	}
+	return &BLSEpochData{
+		DKGPhase:                    phase,
+		DealingPhaseDeadlineBlock:   int64(r.EpochData.DealingPhaseDeadlineBlock),
+		VerifyingPhaseDeadlineBlock: int64(r.EpochData.VerifyingPhaseDeadlineBlock),
+	}, nil
 }

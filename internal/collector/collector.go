@@ -21,6 +21,12 @@ var (
 	pocStatusMap = map[string]float64{
 		"IDLE": 0, "GENERATING": 1, "VALIDATING": 2,
 	}
+	participantStatusMap = map[string]float64{
+		"UNSPECIFIED": 0, "ACTIVE": 1, "INACTIVE": 2, "INVALID": 3, "UNCONFIRMED": 5,
+	}
+	mlNodeServiceStateMap = map[string]float64{
+		"STOPPED": 0, "INFERENCE": 1, "POW": 2, "TRAIN": 3,
+	}
 )
 
 // Collector holds all mutable state for one collection cycle.
@@ -109,11 +115,14 @@ func (c *Collector) collectNetworkParticipants() {
 		slog.Warn("network participants", "err", err)
 		return
 	}
+	metrics.NetTotalParticipantCount.Set(float64(len(participants)))
+	active := 0
 	for _, p := range participants {
 		addr := p.Seed.Participant
 		if addr == "" {
 			continue
 		}
+		active++
 		if p.Weight != nil {
 			metrics.NetParticipantWeight.WithLabelValues(addr).Set(*p.Weight)
 		}
@@ -125,6 +134,7 @@ func (c *Collector) collectNetworkParticipants() {
 			}
 		}
 	}
+	metrics.NetActiveParticipantCount.Set(float64(active))
 }
 
 // --- Pricing and models ---
@@ -153,6 +163,12 @@ func (c *Collector) collectPricingAndModels() {
 			}
 			if m.UnitsOfComputePerToken != nil {
 				metrics.ModelUnits.WithLabelValues(m.ID).Set(*m.UnitsOfComputePerToken)
+			}
+			if m.Utilization != nil {
+				metrics.ModelUtilization.WithLabelValues(m.ID).Set(*m.Utilization * 100)
+			}
+			if m.Capacity != nil {
+				metrics.ModelCapacity.WithLabelValues(m.ID).Set(float64(*m.Capacity))
 			}
 		}
 	}
@@ -222,25 +238,47 @@ func (c *Collector) collectParticipant() {
 		}
 	}
 
-	// 4. Epoch group data — total network weight + estimated reward
+	// 4. Epoch group data — total network weight + estimated reward + reputation + network inference count
 	groupData, err := fetcher.FetchEpochGroupData(c.cfg.NodeRESTURL)
 	if err != nil {
 		slog.Warn("fetch epoch group data", "err", err)
-	} else if groupData.TotalWeight > 0 {
-		// emission(N) = 323000 × exp(-0.000475 × (N-1))
-		emission := 323000.0 * math.Exp(-0.000475*float64(groupData.EpochIndex-1))
-		rewardPerWeight := emission / float64(groupData.TotalWeight)
-		metrics.NetTotalWeight.WithLabelValues(addr).Set(float64(groupData.TotalWeight))
-		metrics.NetRewardPerWeight.WithLabelValues(addr).Set(rewardPerWeight)
-		for _, vw := range groupData.ValidationWeights {
-			if vw.MemberAddress == addr {
-				myWeight, _ := strconv.ParseInt(vw.Weight, 10, 64)
-				c.estimatedReward = float64(myWeight) * rewardPerWeight
-				if chainEpoch > 0 {
-					ce := strconv.FormatInt(chainEpoch, 10)
-					metrics.EpochEstimated.WithLabelValues(addr, ce).Set(c.estimatedReward)
+	} else {
+		if groupData.NumberOfRequests > 0 {
+			metrics.NetEpochInferenceCount.WithLabelValues(addr).Set(float64(groupData.NumberOfRequests))
+		}
+		if groupData.TotalWeight > 0 {
+			// emission(N) = 323000 × exp(-0.000475 × (N-1))
+			emission := 323000.0 * math.Exp(-0.000475*float64(groupData.EpochIndex-1))
+			rewardPerWeight := emission / float64(groupData.TotalWeight)
+			metrics.NetTotalWeight.WithLabelValues(addr).Set(float64(groupData.TotalWeight))
+			metrics.NetRewardPerWeight.WithLabelValues(addr).Set(rewardPerWeight)
+			for _, vw := range groupData.ValidationWeights {
+				if vw.MemberAddress == addr {
+					myWeight, _ := strconv.ParseInt(vw.Weight, 10, 64)
+					c.estimatedReward = float64(myWeight) * rewardPerWeight
+					metrics.ParticipantReputation.WithLabelValues(addr).Set(float64(vw.Reputation))
+					if chainEpoch > 0 {
+						ce := strconv.FormatInt(chainEpoch, 10)
+						metrics.EpochEstimated.WithLabelValues(addr, ce).Set(c.estimatedReward)
+					}
+					break
 				}
-				break
+			}
+		}
+	}
+
+	// 4b. BLS DKG phase
+	if chainEpoch > 0 {
+		bls, blsErr := fetcher.FetchBLSEpoch(c.cfg.APIURL, chainEpoch)
+		if blsErr != nil {
+			slog.Warn("fetch bls epoch", "err", blsErr)
+		} else {
+			metrics.BLSDKGPhase.WithLabelValues(addr).Set(float64(bls.DKGPhase))
+			if bls.DealingPhaseDeadlineBlock > 0 {
+				metrics.BLSDealingDeadline.WithLabelValues(addr).Set(float64(bls.DealingPhaseDeadlineBlock))
+			}
+			if bls.VerifyingPhaseDeadlineBlock > 0 {
+				metrics.BLSVerifyingDeadline.WithLabelValues(addr).Set(float64(bls.VerifyingPhaseDeadlineBlock))
 			}
 		}
 	}
@@ -258,6 +296,13 @@ func (c *Collector) collectParticipant() {
 	metrics.ParticipantEarnedCoins.WithLabelValues(addr).Set(float64(stats.EarnedCoins))
 	metrics.ParticipantValidated.WithLabelValues(addr).Set(float64(stats.ValidatedInferences))
 	metrics.ParticipantInvalidated.WithLabelValues(addr).Set(float64(stats.InvalidatedInferences))
+	// Extended participant health
+	if sv, ok := participantStatusMap[stats.Status]; ok {
+		metrics.ParticipantStatus.WithLabelValues(addr).Set(sv)
+	}
+	metrics.ParticipantConsecutiveInv.WithLabelValues(addr).Set(float64(stats.ConsecutiveInvalidInferences))
+	metrics.ParticipantBurnedCoins.WithLabelValues(addr).Set(float64(stats.BurnedCoins))
+	metrics.ParticipantRewardedCoins.WithLabelValues(addr).Set(float64(stats.RewardedCoins))
 
 	// 6. Wallet balance
 	wallet, walletErr := fetcher.FetchWalletBalance(c.cfg.NodeRESTURL, addr)
@@ -375,7 +420,11 @@ func (c *Collector) recordSnapshot(epoch int64, startTime, endTime float64, wall
 		snap.Claimed     = &perf.Claimed
 	}
 
-	c.history[fmt.Sprintf("%d", epoch)] = snap
+	epochStr := fmt.Sprintf("%d", epoch)
+	if c.history[addr] == nil {
+		c.history[addr] = make(map[string]*state.EpochSnapshot)
+	}
+	c.history[addr][epochStr] = snap
 	state.SaveHistory(c.cfg.HistoryFile, c.history, c.cfg.MaxHistory)
 
 	ce := strconv.FormatInt(epoch, 10)
@@ -479,6 +528,42 @@ func (c *Collector) collectNodes() {
 			gpu := fetcher.FetchGPUStats(host, ni.PocPort)
 			metrics.NodeGPUCount.WithLabelValues(addr, nodeID, host).Set(float64(gpu.Count))
 			metrics.NodeGPUUtil.WithLabelValues(addr, nodeID, host).Set(gpu.AvgUtil)
+			for _, dev := range gpu.Devices {
+				di := strconv.Itoa(dev.Index)
+				metrics.NodeGPUDeviceUtil.WithLabelValues(addr, nodeID, host, di).Set(dev.UtilizationPercent)
+				avail := 0.0
+				if dev.IsAvailable {
+					avail = 1.0
+				}
+				metrics.NodeGPUDeviceAvail.WithLabelValues(addr, nodeID, host, di).Set(avail)
+				if dev.TemperatureC != nil {
+					metrics.NodeGPUDeviceTemp.WithLabelValues(addr, nodeID, host, di).Set(*dev.TemperatureC)
+				}
+				if dev.TotalMemoryMB != nil {
+					metrics.NodeGPUDeviceMemTotal.WithLabelValues(addr, nodeID, host, di).Set(float64(*dev.TotalMemoryMB))
+				}
+				if dev.FreeMemoryMB != nil {
+					metrics.NodeGPUDeviceMemFree.WithLabelValues(addr, nodeID, host, di).Set(float64(*dev.FreeMemoryMB))
+				}
+				if dev.UsedMemoryMB != nil {
+					metrics.NodeGPUDeviceMemUsed.WithLabelValues(addr, nodeID, host, di).Set(float64(*dev.UsedMemoryMB))
+				}
+			}
+
+			// ML node service state
+			if svcState, svcErr := fetcher.FetchMLNodeState(host, ni.PocPort); svcErr != nil {
+				slog.Debug("ml node state unavailable", "node", nodeID, "err", svcErr)
+			} else {
+				sv := mlNodeServiceStateMap[svcState]
+				metrics.NodeServiceState.WithLabelValues(addr, nodeID, host).Set(sv)
+			}
+
+			// ML node disk space
+			if diskGB, diskErr := fetcher.FetchMLNodeDiskSpaceGB(host, ni.PocPort); diskErr != nil {
+				slog.Debug("ml node disk space unavailable", "node", nodeID, "err", diskErr)
+			} else {
+				metrics.NodeDiskAvailableGB.WithLabelValues(addr, nodeID, host).Set(diskGB)
+			}
 		}
 	}
 }
@@ -486,49 +571,49 @@ func (c *Collector) collectNodes() {
 // --- Restore metrics from history on startup ---
 
 func (c *Collector) restoreMetrics() {
-	addr := c.cfg.Participant
-	for epochStr, snap := range c.history {
-		p := snap.Participant
-		if p == "" {
-			p = addr
-		}
-		e := epochStr
-		metrics.EpochInferences.WithLabelValues(p, e).Set(float64(snap.InferenceCount))
-		metrics.EpochMissed.WithLabelValues(p, e).Set(float64(snap.MissedRequests))
-		metrics.EpochEarnedCoins.WithLabelValues(p, e).Set(float64(snap.EarnedCoins))
-		metrics.EpochValidated.WithLabelValues(p, e).Set(float64(snap.ValidatedInferences))
-		metrics.EpochInvalidated.WithLabelValues(p, e).Set(float64(snap.InvalidatedInferences))
-		metrics.EpochCoinBalance.WithLabelValues(p, e).Set(float64(snap.CoinBalance))
-		metrics.EpochDone.WithLabelValues(p, e).Set(float64(snap.EpochsCompleted))
-		metrics.EpochMissRate.WithLabelValues(p, e).Set(snap.MissRatePercent)
-		metrics.EpochTimeslot.WithLabelValues(p, e).Set(float64(snap.TimeslotAssigned))
-		for nodeID, pw := range snap.PocWeights {
-			metrics.EpochPocWeight.WithLabelValues(p, e, nodeID).Set(float64(pw))
-		}
-		if snap.StartTime > 0 {
-			metrics.EpochStartTime.WithLabelValues(p, e).Set(snap.StartTime)
-		}
-		if snap.EndTime > 0 {
-			metrics.EpochEndTime.WithLabelValues(p, e).Set(snap.EndTime)
-		}
-		if snap.DurationSeconds > 0 {
-			metrics.EpochDuration.WithLabelValues(p, e).Set(snap.DurationSeconds)
-		}
-		if snap.EarnedGNK != nil {
-			metrics.EpochEarnedGNK.WithLabelValues(p, e).Set(*snap.EarnedGNK)
-		}
-		if snap.RewardedGNK != nil {
-			metrics.EpochRewardedGNK.WithLabelValues(p, e).Set(*snap.RewardedGNK)
-		}
-		if snap.EstimatedGNK != nil {
-			metrics.EpochEstimated.WithLabelValues(p, e).Set(*snap.EstimatedGNK)
-		}
-		if snap.Claimed != nil {
-			metrics.EpochClaimed.WithLabelValues(p, e).Set(float64(*snap.Claimed))
+	total := 0
+	for participant, epochs := range c.history {
+		for epochStr, snap := range epochs {
+			p := participant
+			e := epochStr
+			metrics.EpochInferences.WithLabelValues(p, e).Set(float64(snap.InferenceCount))
+			metrics.EpochMissed.WithLabelValues(p, e).Set(float64(snap.MissedRequests))
+			metrics.EpochEarnedCoins.WithLabelValues(p, e).Set(float64(snap.EarnedCoins))
+			metrics.EpochValidated.WithLabelValues(p, e).Set(float64(snap.ValidatedInferences))
+			metrics.EpochInvalidated.WithLabelValues(p, e).Set(float64(snap.InvalidatedInferences))
+			metrics.EpochCoinBalance.WithLabelValues(p, e).Set(float64(snap.CoinBalance))
+			metrics.EpochDone.WithLabelValues(p, e).Set(float64(snap.EpochsCompleted))
+			metrics.EpochMissRate.WithLabelValues(p, e).Set(snap.MissRatePercent)
+			metrics.EpochTimeslot.WithLabelValues(p, e).Set(float64(snap.TimeslotAssigned))
+			for nodeID, pw := range snap.PocWeights {
+				metrics.EpochPocWeight.WithLabelValues(p, e, nodeID).Set(float64(pw))
+			}
+			if snap.StartTime > 0 {
+				metrics.EpochStartTime.WithLabelValues(p, e).Set(snap.StartTime)
+			}
+			if snap.EndTime > 0 {
+				metrics.EpochEndTime.WithLabelValues(p, e).Set(snap.EndTime)
+			}
+			if snap.DurationSeconds > 0 {
+				metrics.EpochDuration.WithLabelValues(p, e).Set(snap.DurationSeconds)
+			}
+			if snap.EarnedGNK != nil {
+				metrics.EpochEarnedGNK.WithLabelValues(p, e).Set(*snap.EarnedGNK)
+			}
+			if snap.RewardedGNK != nil {
+				metrics.EpochRewardedGNK.WithLabelValues(p, e).Set(*snap.RewardedGNK)
+			}
+			if snap.EstimatedGNK != nil {
+				metrics.EpochEstimated.WithLabelValues(p, e).Set(*snap.EstimatedGNK)
+			}
+			if snap.Claimed != nil {
+				metrics.EpochClaimed.WithLabelValues(p, e).Set(float64(*snap.Claimed))
+			}
+			total++
 		}
 	}
-	if len(c.history) > 0 {
-		slog.Info("restored epoch metrics from history", "count", len(c.history))
+	if total > 0 {
+		slog.Info("restored epoch metrics from history", "participants", len(c.history), "total_epochs", total)
 	}
 }
 

@@ -24,6 +24,22 @@ var (
 	NodeHardwareInfo = gaugeVec("gonka_node_hardware_info",       "Hardware info (value=1, metadata in labels)",                                       "participant", "node_id", "host", "hardware_type", "hardware_count")
 )
 
+// Node GPU — per device
+var (
+	NodeGPUDeviceUtil    = gaugeVec("gonka_node_gpu_device_utilization_percent", "Per-device GPU compute utilization %",    "participant", "node_id", "host", "device_index")
+	NodeGPUDeviceTemp    = gaugeVec("gonka_node_gpu_device_temperature_celsius",  "Per-device GPU temperature °C",           "participant", "node_id", "host", "device_index")
+	NodeGPUDeviceMemTotal= gaugeVec("gonka_node_gpu_device_memory_total_mb",      "Per-device GPU total memory MB",          "participant", "node_id", "host", "device_index")
+	NodeGPUDeviceMemFree = gaugeVec("gonka_node_gpu_device_memory_free_mb",       "Per-device GPU free memory MB",           "participant", "node_id", "host", "device_index")
+	NodeGPUDeviceMemUsed = gaugeVec("gonka_node_gpu_device_memory_used_mb",       "Per-device GPU used memory MB",           "participant", "node_id", "host", "device_index")
+	NodeGPUDeviceAvail   = gaugeVec("gonka_node_gpu_device_available",             "Per-device GPU available (1=yes 0=no)",   "participant", "node_id", "host", "device_index")
+)
+
+// Node ML service state
+var (
+	NodeServiceState     = gaugeVec("gonka_node_service_state",          "ML node service state (0=STOPPED 1=INFERENCE 2=POW 3=TRAIN)", "participant", "node_id", "host")
+	NodeDiskAvailableGB  = gaugeVec("gonka_node_disk_available_gb",      "ML node model cache available disk space GB",                  "participant", "node_id", "host")
+)
+
 // Network-wide
 var (
 	NetParticipantWeight = gaugeVec("gonka_network_participant_weight", "Per-participant weight in active epoch",    "participant")
@@ -53,6 +69,35 @@ var (
 	ParticipantEarnedCoins = gaugeVec("gonka_participant_earned_coins",           "Earned coins in current epoch",          "participant")
 	ParticipantValidated   = gaugeVec("gonka_participant_validated_inferences",   "Validated inferences in current epoch",  "participant")
 	ParticipantInvalidated = gaugeVec("gonka_participant_invalidated_inferences", "Invalidated inferences in current epoch","participant")
+)
+
+// Participant health (extended)
+var (
+	ParticipantStatus           = gaugeVec("gonka_participant_status",                        "Participant status (0=UNSPECIFIED 1=ACTIVE 2=INACTIVE 3=INVALID 5=UNCONFIRMED)", "participant")
+	ParticipantConsecutiveInv   = gaugeVec("gonka_participant_consecutive_invalid_inferences", "Consecutive invalid inferences counter",                                         "participant")
+	ParticipantBurnedCoins      = gaugeVec("gonka_participant_burned_coins",                   "Burned (penalized) coins in current epoch",                                      "participant")
+	ParticipantRewardedCoins    = gaugeVec("gonka_participant_rewarded_coins",                 "Rewarded coins in current epoch (after distribution)",                           "participant")
+	ParticipantReputation       = gaugeVec("gonka_participant_reputation",                     "Participant reputation score from epoch group data",                             "participant")
+)
+
+// Network — counts and epoch-level
+var (
+	NetActiveParticipantCount = gauge("gonka_network_active_participant_count", "Number of active participants in current epoch")
+	NetTotalParticipantCount  = gauge("gonka_network_total_participant_count",  "Total number of participants in current epoch")
+	NetEpochInferenceCount    = gaugeVec("gonka_network_epoch_inference_count", "Total network inferences in current epoch", "participant")
+)
+
+// BLS DKG phase
+var (
+	BLSDKGPhase              = gaugeVec("gonka_bls_dkg_phase",               "BLS DKG phase (0=UNDEFINED 1=DEALING 2=VERIFYING 3=COMPLETED 4=FAILED 5=SIGNED)", "participant")
+	BLSDealingDeadline       = gaugeVec("gonka_bls_dealing_deadline_block",   "BLS dealing phase deadline block height",                                          "participant")
+	BLSVerifyingDeadline     = gaugeVec("gonka_bls_verifying_deadline_block", "BLS verifying phase deadline block height",                                        "participant")
+)
+
+// Model utilization / capacity
+var (
+	ModelUtilization = gaugeVec("gonka_model_utilization_percent", "Model utilization % (inferences/capacity)", "model_id")
+	ModelCapacity    = gaugeVec("gonka_model_capacity",             "Model maximum capacity (AI tokens/epoch)",  "model_id")
 )
 
 // Epoch history (label epoch = chain epoch number as string)

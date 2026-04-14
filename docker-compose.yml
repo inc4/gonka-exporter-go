@@ -29,7 +29,7 @@ services:
     networks:
       - gonka-network
     ports:
-      - "${EXPORTER_PORT:-9401}:9401"
+      - "9404:9404"
     volumes:
       - epoch-data:/data
     environment:
