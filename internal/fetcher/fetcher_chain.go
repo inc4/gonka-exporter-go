@@ -55,6 +55,9 @@ func (h *HTTPFetcher) FetchBlockTimeAtHeight(rpcURL string, height int64) (float
 }
 
 func (h *HTTPFetcher) FetchMaxBlockHeightFromNodes(nodes []string) (int64, string) {
+	if len(nodes) == 0 {
+		return 0, ""
+	}
 	sample := rand.Perm(len(nodes))
 	if len(sample) > 5 {
 		sample = sample[:5]

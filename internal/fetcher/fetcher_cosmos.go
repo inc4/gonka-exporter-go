@@ -77,8 +77,14 @@ func (h *HTTPFetcher) FetchEpochGroupData(restURL string) (*EpochGroupData, erro
 	if err := get(restURL+"/productscience/inference/inference/current_epoch_group_data", &r); err != nil {
 		return nil, err
 	}
-	tw, _ := strconv.ParseInt(r.EpochGroupData.TotalWeight, 10, 64)
-	ei, _ := strconv.ParseInt(r.EpochGroupData.EpochIndex, 10, 64)
+	tw, err := strconv.ParseInt(r.EpochGroupData.TotalWeight, 10, 64)
+	if err != nil {
+		return nil, fmt.Errorf("parse current_epoch_group_data total_weight %q: %w", r.EpochGroupData.TotalWeight, err)
+	}
+	ei, err := strconv.ParseInt(r.EpochGroupData.EpochIndex, 10, 64)
+	if err != nil {
+		return nil, fmt.Errorf("parse current_epoch_group_data epoch_index %q: %w", r.EpochGroupData.EpochIndex, err)
+	}
 	return &EpochGroupData{
 		TotalWeight:       tw,
 		EpochIndex:        ei,

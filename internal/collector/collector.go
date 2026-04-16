@@ -534,6 +534,27 @@ func (c *Collector) collectNodes() {
 		return
 	}
 
+	c.m.NodeHardwareInfo.Reset()
+	c.m.NodeStatus.Reset()
+	c.m.NodeIntended.Reset()
+	c.m.PocCurrent.Reset()
+	c.m.PocIntended.Reset()
+	c.m.NodePocWeight.Reset()
+	c.m.NodeTimeslot.Reset()
+	c.m.NodeGPUCount.Reset()
+	c.m.NodeGPUUtil.Reset()
+	c.m.NodeGPUDeviceUtil.Reset()
+	c.m.NodeGPUDeviceTemp.Reset()
+	c.m.NodeGPUDeviceMemTotal.Reset()
+	c.m.NodeGPUDeviceMemFree.Reset()
+	c.m.NodeGPUDeviceMemUsed.Reset()
+	c.m.NodeGPUDeviceAvail.Reset()
+	c.m.NodeServiceState.Reset()
+	c.m.NodeDiskAvailableGB.Reset()
+	c.m.NodeGPUDriverInfo.Reset()
+	c.m.NodeManagerRunning.Reset()
+	c.m.NodeManagerHealthy.Reset()
+
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	for _, entry := range nodes {

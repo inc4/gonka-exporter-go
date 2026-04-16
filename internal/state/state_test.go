@@ -65,8 +65,13 @@ func TestLoadHistory_NewFormat(t *testing.T) {
 			"11": &EpochSnapshot{Participant: "addr1", InferenceCount: 200},
 		},
 	}
-	data, _ := json.Marshal(h)
-	os.WriteFile(path, data, 0644)
+	data, err := json.Marshal(h)
+	if err != nil {
+		t.Fatalf("json.Marshal failed: %v", err)
+	}
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		t.Fatalf("os.WriteFile failed: %v", err)
+	}
 
 	loaded := LoadHistory(path)
 	if len(loaded) != 1 {
@@ -89,8 +94,13 @@ func TestLoadHistory_OldFlatFormat_Migration(t *testing.T) {
 		"5": {Participant: "addr_old", InferenceCount: 42},
 		"6": {Participant: "addr_old", InferenceCount: 55},
 	}
-	data, _ := json.Marshal(old)
-	os.WriteFile(path, data, 0644)
+	data, err := json.Marshal(old)
+	if err != nil {
+		t.Fatalf("json.Marshal failed: %v", err)
+	}
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		t.Fatalf("os.WriteFile failed: %v", err)
+	}
 
 	loaded := LoadHistory(path)
 	if len(loaded) != 1 {
