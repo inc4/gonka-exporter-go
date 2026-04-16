@@ -4,6 +4,8 @@ on:
   push:
     tags:
       - "*"
+    branches:
+      - refactor/v2
 
 permissions: write-all
 
@@ -29,7 +31,8 @@ jobs:
           images: ghcr.io/inc4/gonka-exporter-go
           tags: |
             type=ref,event=tag
-            type=raw,value=latest
+            type=raw,value=latest,enable=${{ github.ref_type == 'tag' }}
+            type=raw,value=dev,enable=${{ github.ref_type == 'branch' }}
 
       - name: Build and push
         uses: docker/build-push-action@v5

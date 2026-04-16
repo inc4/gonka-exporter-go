@@ -10,10 +10,12 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/gonka/exporter/internal/collector"
 	"github.com/gonka/exporter/internal/config"
+	"github.com/gonka/exporter/internal/fetcher"
 )
 
 func main() {
@@ -37,7 +39,7 @@ func main() {
 		slog.Warn("PARTICIPANT_ADDRESS is not set — participant metrics will be skipped")
 	}
 
-	c := collector.New(cfg)
+	c := collector.New(cfg, fetcher.NewHTTPFetcher(), prometheus.DefaultRegisterer)
 
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())

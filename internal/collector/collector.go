@@ -4,9 +4,13 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/gonka/exporter/internal/config"
 	"github.com/gonka/exporter/internal/fetcher"
@@ -31,20 +35,26 @@ var (
 
 // Collector holds all mutable state for one collection cycle.
 type Collector struct {
-	cfg              config.Config
-	st               state.EpochState
-	history          state.History
-	epochMax         map[int64]*state.EpochMaxValues
-	epochNode        state.EpochNodeState
-	estimatedReward  float64 // last calculated estimated reward for current epoch
+	cfg             config.Config
+	f               fetcher.Fetcher
+	m               *metrics.Metrics
+	st              state.EpochState
+	history         state.History
+	epochMax        map[int64]*state.EpochMaxValues
+	epochNode       state.EpochNodeState
+	estimatedReward float64 // last calculated estimated reward for current epoch
 }
 
 // New creates a Collector, restoring persisted state and history.
-func New(cfg config.Config) *Collector {
-	st      := state.LoadState(cfg.StateFile)
+// reg is the Prometheus registerer to use; pass prometheus.DefaultRegisterer in production,
+// prometheus.NewRegistry() in tests.
+func New(cfg config.Config, f fetcher.Fetcher, reg prometheus.Registerer) *Collector {
+	st := state.LoadState(cfg.StateFile)
 	history := state.LoadHistory(cfg.HistoryFile)
 	c := &Collector{
 		cfg:       cfg,
+		f:         f,
+		m:         metrics.NewMetrics(reg),
 		st:        st,
 		history:   history,
 		epochMax:  make(map[int64]*state.EpochMaxValues),
@@ -77,49 +87,51 @@ func (c *Collector) collectChain() {
 	}
 
 	go func() {
-		h, t := fetcher.FetchMaxBlockHeightFromNodes(c.cfg.BlockHeightNodes)
+		h, t := c.f.FetchMaxBlockHeightFromNodes(c.cfg.BlockHeightNodes)
 		if h > 0 {
-			metrics.BlockHeightMax.WithLabelValues(p).Set(float64(h))
+			c.m.BlockHeightMax.WithLabelValues(p).Set(float64(h))
 		}
 		if t != "" {
 			ts := strings.TrimSuffix(t, "Z")
 			if parsed, err := time.Parse("2006-01-02T15:04:05.999999999", ts); err == nil {
-				metrics.BlockTime.WithLabelValues(p).Set(float64(parsed.Unix()))
+				c.m.BlockTimeNetwork.WithLabelValues(p).Set(float64(parsed.Unix()))
 			}
 		}
 	}()
 
-	status, err := fetcher.FetchTendermintStatus(c.cfg.NodeRPCURL)
+	status, err := c.f.FetchTendermintStatus(c.cfg.NodeRPCURL)
 	if err != nil {
 		slog.Warn("tendermint status", "err", err)
 		return
 	}
 	si := status.Result.SyncInfo
 	if h, err := strconv.ParseInt(si.LatestBlockHeight, 10, 64); err == nil {
-		metrics.BlockHeight.WithLabelValues(p).Set(float64(h))
+		c.m.BlockHeight.WithLabelValues(p).Set(float64(h))
 	}
 	if si.LatestBlockTime != "" {
 		ts := strings.TrimSuffix(si.LatestBlockTime, "Z")
 		if parsed, err := time.Parse("2006-01-02T15:04:05.999999999", ts); err == nil {
-			metrics.BlockTime.WithLabelValues(p).Set(float64(parsed.Unix()))
+			c.m.BlockTimeLocal.WithLabelValues(p).Set(float64(parsed.Unix()))
 		}
 	}
 	catching := 0.0
 	if si.CatchingUp {
 		catching = 1.0
 	}
-	metrics.CatchingUp.WithLabelValues(p).Set(catching)
+	c.m.CatchingUp.WithLabelValues(p).Set(catching)
 }
 
 // --- Network-wide participants ---
 
 func (c *Collector) collectNetworkParticipants() {
-	participants, err := fetcher.FetchNetworkParticipants(c.cfg.APIURL)
+	participants, err := c.f.FetchNetworkParticipants(c.cfg.APIURL)
 	if err != nil {
 		slog.Warn("network participants", "err", err)
 		return
 	}
-	metrics.NetTotalParticipantCount.Set(float64(len(participants)))
+	c.m.NetTotalParticipantCount.Set(float64(len(participants)))
+	c.m.NetParticipantWeight.Reset()
+	c.m.NetNodePocWeight.Reset()
 	active := 0
 	for _, p := range participants {
 		addr := p.Seed.Participant
@@ -128,56 +140,56 @@ func (c *Collector) collectNetworkParticipants() {
 		}
 		active++
 		if p.Weight != nil {
-			metrics.NetParticipantWeight.WithLabelValues(addr).Set(*p.Weight)
+			c.m.NetParticipantWeight.WithLabelValues(addr).Set(*p.Weight)
 		}
 		for _, group := range p.MLNodes {
 			for _, node := range group.MLNodes {
 				if node.NodeID != "" && node.PocWeight != nil {
-					metrics.NetNodePocWeight.WithLabelValues(addr, node.NodeID).Set(*node.PocWeight)
+					c.m.NetNodePocWeight.WithLabelValues(addr, node.NodeID).Set(*node.PocWeight)
 				}
 			}
 		}
 	}
-	metrics.NetActiveParticipantCount.Set(float64(active))
+	c.m.NetActiveParticipantCount.Set(float64(active))
 }
 
 // --- Pricing and models ---
 
 func (c *Collector) collectPricingAndModels() {
-	pricing, err := fetcher.FetchPricing(c.cfg.APIURL)
+	pricing, err := c.f.FetchPricing(c.cfg.APIURL)
 	if err != nil {
 		slog.Warn("pricing", "err", err)
 	} else {
 		if pricing.UnitOfComputePrice != nil {
-			metrics.PricingUoC.Set(*pricing.UnitOfComputePrice)
+			c.m.PricingUoC.Set(*pricing.UnitOfComputePrice)
 		}
 		if pricing.DynamicPricingEnabled != nil {
 			v := 0.0
 			if *pricing.DynamicPricingEnabled {
 				v = 1.0
 			}
-			metrics.PricingDynamic.Set(v)
+			c.m.PricingDynamic.Set(v)
 		}
 		for _, m := range pricing.Models {
 			if m.ID == "" {
 				continue
 			}
 			if m.PricePerToken != nil {
-				metrics.ModelPrice.WithLabelValues(m.ID).Set(*m.PricePerToken)
+				c.m.ModelPrice.WithLabelValues(m.ID).Set(*m.PricePerToken)
 			}
 			if m.UnitsOfComputePerToken != nil {
-				metrics.ModelUnits.WithLabelValues(m.ID).Set(*m.UnitsOfComputePerToken)
+				c.m.ModelUnits.WithLabelValues(m.ID).Set(*m.UnitsOfComputePerToken)
 			}
 			if m.Utilization != nil {
-				metrics.ModelUtilization.WithLabelValues(m.ID).Set(*m.Utilization * 100)
+				c.m.ModelUtilization.WithLabelValues(m.ID).Set(*m.Utilization * 100)
 			}
 			if m.Capacity != nil {
-				metrics.ModelCapacity.WithLabelValues(m.ID).Set(float64(*m.Capacity))
+				c.m.ModelCapacity.WithLabelValues(m.ID).Set(float64(*m.Capacity))
 			}
 		}
 	}
 
-	models, err := fetcher.FetchModels(c.cfg.APIURL)
+	models, err := c.f.FetchModels(c.cfg.APIURL)
 	if err != nil {
 		slog.Warn("models", "err", err)
 		return
@@ -187,13 +199,13 @@ func (c *Collector) collectPricingAndModels() {
 			continue
 		}
 		if m.VRAM != nil {
-			metrics.ModelVRAM.WithLabelValues(m.ID).Set(*m.VRAM)
+			c.m.ModelVRAM.WithLabelValues(m.ID).Set(*m.VRAM)
 		}
 		if m.ThroughputPerNonce != nil {
-			metrics.ModelThroughput.WithLabelValues(m.ID).Set(*m.ThroughputPerNonce)
+			c.m.ModelThroughput.WithLabelValues(m.ID).Set(*m.ThroughputPerNonce)
 		}
 		if m.ValidationThreshold != nil {
-			metrics.ModelValThresh.WithLabelValues(m.ID).Set(
+			c.m.ModelValThresh.WithLabelValues(m.ID).Set(
 				m.ValidationThreshold.Value * math.Pow10(m.ValidationThreshold.Exponent),
 			)
 		}
@@ -209,171 +221,45 @@ func (c *Collector) collectParticipant() {
 	}
 
 	now := float64(time.Now().UnixNano()) / 1e9
-
-	// 1. Chain epoch
-	chainEpoch, err := fetcher.FetchCurrentEpoch(c.cfg.NodeRESTURL)
-	if err != nil {
-		slog.Warn("fetch current epoch", "err", err)
-	} else {
-		metrics.ChainEpoch.WithLabelValues(addr).Set(float64(chainEpoch))
-	}
-
-	// 2. Save prev start time before updating
 	prevEpochStartTime := c.st.EpochStartTime
+	chainEpoch := c.fetchAndSetChainEpoch(addr)
 
-	// 3. Epoch info — real start time from blockchain
-	var epochInfo *fetcher.EpochInfo
-	epochInfo, err = fetcher.FetchEpochInfo(c.cfg.NodeRESTURL)
-	if err != nil {
-		slog.Warn("fetch epoch info", "err", err)
-	} else {
-		c.st.EpochLength = epochInfo.EpochLength
-		if epochInfo.PocStartBlockHeight != c.st.PocStartBlockHeight {
-			if t, err := fetcher.FetchBlockTimeAtHeight(c.cfg.NodeRPCURL, epochInfo.PocStartBlockHeight); err != nil {
-				slog.Warn("fetch block time", "height", epochInfo.PocStartBlockHeight, "err", err)
-			} else {
-				c.st.PocStartBlockHeight = epochInfo.PocStartBlockHeight
-				c.st.EpochStartTime = t
-				slog.Info("epoch start block time",
-					"epoch", chainEpoch,
-					"block", epochInfo.PocStartBlockHeight,
-					"time", time.Unix(int64(t), 0).UTC().Format(time.RFC3339))
-			}
-		}
-	}
+	epochInfo := c.fetchAndSetEpochInfo(chainEpoch)
 
-	// 4. Epoch group data — total network weight + estimated reward + reputation + network inference count
-	groupData, err := fetcher.FetchEpochGroupData(c.cfg.NodeRESTURL)
-	if err != nil {
-		slog.Warn("fetch epoch group data", "err", err)
-	} else {
-		if groupData.NumberOfRequests > 0 {
-			metrics.NetEpochInferenceCount.WithLabelValues(addr).Set(float64(groupData.NumberOfRequests))
-		}
-		if groupData.TotalWeight > 0 {
-			// emission(N) = 323000 × exp(-0.000475 × (N-1))
-			emission := 323000.0 * math.Exp(-0.000475*float64(groupData.EpochIndex-1))
-			rewardPerWeight := emission / float64(groupData.TotalWeight)
-			metrics.NetTotalWeight.WithLabelValues(addr).Set(float64(groupData.TotalWeight))
-			metrics.NetRewardPerWeight.WithLabelValues(addr).Set(rewardPerWeight)
-			for _, vw := range groupData.ValidationWeights {
-				if vw.MemberAddress == addr {
-					myWeight, _ := strconv.ParseInt(vw.Weight, 10, 64)
-					c.estimatedReward = float64(myWeight) * rewardPerWeight
-					metrics.ParticipantReputation.WithLabelValues(addr).Set(float64(vw.Reputation))
-					if chainEpoch > 0 {
-						ce := strconv.FormatInt(chainEpoch, 10)
-						metrics.EpochEstimated.WithLabelValues(addr, ce).Set(c.estimatedReward)
-					}
-					break
-				}
-			}
-		}
-	}
+	c.fetchAndSetGroupData(addr, chainEpoch)
 
-	// 4b. BLS DKG phase
-	if chainEpoch > 0 {
-		bls, blsErr := fetcher.FetchBLSEpoch(c.cfg.APIURL, chainEpoch)
-		if blsErr != nil {
-			slog.Warn("fetch bls epoch", "err", blsErr)
-		} else {
-			metrics.BLSDKGPhase.WithLabelValues(addr).Set(float64(bls.DKGPhase))
-			if bls.DealingPhaseDeadlineBlock > 0 {
-				metrics.BLSDealingDeadline.WithLabelValues(addr).Set(float64(bls.DealingPhaseDeadlineBlock))
-			}
-			if bls.VerifyingPhaseDeadlineBlock > 0 {
-				metrics.BLSVerifyingDeadline.WithLabelValues(addr).Set(float64(bls.VerifyingPhaseDeadlineBlock))
-			}
-		}
-	}
+	c.fetchAndSetBLS(addr, chainEpoch)
 
-	// 5. Participant stats
-	stats, err := fetcher.FetchParticipantStats(c.cfg.NodeRESTURL, addr)
-	if err != nil {
-		slog.Warn("fetch participant stats", "err", err)
+	stats, ok := c.fetchAndSetParticipantStats(addr)
+	if !ok {
 		return
 	}
-	metrics.ParticipantEpochsDone.WithLabelValues(addr).Set(float64(stats.EpochsCompleted))
-	metrics.ParticipantCoinBalance.WithLabelValues(addr).Set(float64(stats.CoinBalance))
-	metrics.ParticipantInferences.WithLabelValues(addr).Set(float64(stats.InferenceCount))
-	metrics.ParticipantMissed.WithLabelValues(addr).Set(float64(stats.MissedRequests))
-	metrics.ParticipantEarnedCoins.WithLabelValues(addr).Set(float64(stats.EarnedCoins))
-	metrics.ParticipantValidated.WithLabelValues(addr).Set(float64(stats.ValidatedInferences))
-	metrics.ParticipantInvalidated.WithLabelValues(addr).Set(float64(stats.InvalidatedInferences))
-	// Extended participant health
-	if sv, ok := participantStatusMap[stats.Status]; ok {
-		metrics.ParticipantStatus.WithLabelValues(addr).Set(sv)
-	}
-	metrics.ParticipantConsecutiveInv.WithLabelValues(addr).Set(float64(stats.ConsecutiveInvalidInferences))
-	metrics.ParticipantBurnedCoins.WithLabelValues(addr).Set(float64(stats.BurnedCoins))
-	metrics.ParticipantRewardedCoins.WithLabelValues(addr).Set(float64(stats.RewardedCoins))
 
-	// 6. Wallet balance
-	wallet, walletErr := fetcher.FetchWalletBalance(c.cfg.NodeRESTURL, addr)
-	if walletErr != nil {
-		slog.Warn("fetch wallet balance", "err", walletErr)
-	} else {
-		metrics.ParticipantWallet.WithLabelValues(addr).Set(wallet)
-		if c.st.WalletBalanceAtEpochStart == 0 {
-			c.st.WalletBalanceAtEpochStart = wallet
-		}
-	}
+	wallet, walletOK := c.fetchAndSetWallet(addr)
 
-	// 7. Per-epoch max tracking + live gauges
-	if chainEpoch > 0 {
-		if _, ok := c.epochMax[chainEpoch]; !ok {
-			c.epochMax[chainEpoch] = &state.EpochMaxValues{}
-		}
-		em := c.epochMax[chainEpoch]
-		em.InferenceCount        = max64(em.InferenceCount,        stats.InferenceCount)
-		em.MissedRequests        = max64(em.MissedRequests,        stats.MissedRequests)
-		em.EarnedCoins           = max64(em.EarnedCoins,           stats.EarnedCoins)
-		em.ValidatedInferences   = max64(em.ValidatedInferences,   stats.ValidatedInferences)
-		em.InvalidatedInferences = max64(em.InvalidatedInferences, stats.InvalidatedInferences)
-		em.CoinBalance           = max64(em.CoinBalance,           stats.CoinBalance)
-		em.EpochsCompleted       = max64(em.EpochsCompleted,       stats.EpochsCompleted)
+	c.updateEpochMaxAndGauges(addr, chainEpoch, stats, wallet, walletOK, epochInfo, now)
 
-		ce := strconv.FormatInt(chainEpoch, 10)
-		metrics.EpochInferences.WithLabelValues(addr, ce).Set(float64(em.InferenceCount))
-		metrics.EpochMissed.WithLabelValues(addr, ce).Set(float64(em.MissedRequests))
-		metrics.EpochEarnedCoins.WithLabelValues(addr, ce).Set(float64(em.EarnedCoins))
-		metrics.EpochValidated.WithLabelValues(addr, ce).Set(float64(em.ValidatedInferences))
-		metrics.EpochInvalidated.WithLabelValues(addr, ce).Set(float64(em.InvalidatedInferences))
-		metrics.EpochCoinBalance.WithLabelValues(addr, ce).Set(float64(em.CoinBalance))
-		metrics.EpochDone.WithLabelValues(addr, ce).Set(float64(em.EpochsCompleted))
-		metrics.EpochMissRate.WithLabelValues(addr, ce).Set(state.MissRate(em.InferenceCount, em.MissedRequests))
+	c.detectAndRecordEpochBoundary(chainEpoch, prevEpochStartTime, wallet, walletOK)
+}
 
-		if walletErr == nil {
-			metrics.EpochEarnedGNK.WithLabelValues(addr, ce).Set(wallet - c.st.WalletBalanceAtEpochStart)
-		}
-		if c.st.EpochStartTime > 0 {
-			metrics.EpochStartTime.WithLabelValues(addr, ce).Set(c.st.EpochStartTime)
-		}
-		if epochInfo != nil && c.st.EpochStartTime > 0 && c.st.PocStartBlockHeight > 0 && c.st.EpochLength > 0 {
-			blocksElapsed := epochInfo.BlockHeight - c.st.PocStartBlockHeight
-			timeElapsed   := now - c.st.EpochStartTime
-			if blocksElapsed > 0 && timeElapsed > 0 {
-				avgBlockTime    := timeElapsed / float64(blocksElapsed)
-				blocksRemaining := c.st.EpochLength - blocksElapsed
-				metrics.EpochEndTime.WithLabelValues(addr, ce).Set(now + float64(blocksRemaining)*avgBlockTime)
-			}
-		}
-	}
+// --- collectParticipant helpers ---
 
-	// 8. Epoch boundary detection
+func (c *Collector) detectAndRecordEpochBoundary(chainEpoch int64, prevEpochStartTime float64, wallet float64, walletOK bool) {
 	prevEpoch := c.st.ChainEpoch
 	if c.st.Valid && prevEpoch > 0 && chainEpoch > prevEpoch {
 		if chainEpoch > prevEpoch+1 {
 			slog.Warn("skipped epochs", "from", prevEpoch, "to", chainEpoch)
 		}
-		c.recordSnapshot(prevEpoch, prevEpochStartTime, c.st.EpochStartTime, wallet, walletErr == nil)
-		c.st.WalletBalanceAtEpochStart = wallet
+		c.recordSnapshot(prevEpoch, prevEpochStartTime, c.st.EpochStartTime, wallet, walletOK)
+		if walletOK {
+			c.st.WalletBalanceAtEpochStart = wallet
+		}
 		c.pruneEpochMax()
 	} else if !c.st.Valid {
-		c.st.WalletBalanceAtEpochStart = wallet
+		if walletOK {
+			c.st.WalletBalanceAtEpochStart = wallet
+		}
 	}
-
-	// 9. Persist state on epoch change
 	changed := c.st.ChainEpoch != chainEpoch
 	c.st.ChainEpoch = chainEpoch
 	c.st.Valid = true
@@ -382,9 +268,168 @@ func (c *Collector) collectParticipant() {
 	}
 }
 
+func (c *Collector) updateEpochMaxAndGauges(addr string, chainEpoch int64, stats *fetcher.ParticipantStats, wallet float64, walletOK bool, epochInfo *fetcher.EpochInfo, now float64) {
+	if chainEpoch == 0 {
+		return
+	}
+	if _, ok := c.epochMax[chainEpoch]; !ok {
+		c.epochMax[chainEpoch] = &state.EpochMaxValues{}
+	}
+	em := c.epochMax[chainEpoch]
+	em.InferenceCount        = max(em.InferenceCount,        stats.InferenceCount)
+	em.MissedRequests        = max(em.MissedRequests,        stats.MissedRequests)
+	em.EarnedCoins           = max(em.EarnedCoins,           stats.EarnedCoins)
+	em.ValidatedInferences   = max(em.ValidatedInferences,   stats.ValidatedInferences)
+	em.InvalidatedInferences = max(em.InvalidatedInferences, stats.InvalidatedInferences)
+	em.CoinBalance           = max(em.CoinBalance,           stats.CoinBalance)
+	em.EpochsCompleted       = max(em.EpochsCompleted,       stats.EpochsCompleted)
+
+	ce := strconv.FormatInt(chainEpoch, 10)
+	c.m.EpochInferences.WithLabelValues(addr, ce).Set(float64(em.InferenceCount))
+	c.m.EpochMissed.WithLabelValues(addr, ce).Set(float64(em.MissedRequests))
+	c.m.EpochEarnedCoins.WithLabelValues(addr, ce).Set(float64(em.EarnedCoins))
+	c.m.EpochValidated.WithLabelValues(addr, ce).Set(float64(em.ValidatedInferences))
+	c.m.EpochInvalidated.WithLabelValues(addr, ce).Set(float64(em.InvalidatedInferences))
+	c.m.EpochCoinBalance.WithLabelValues(addr, ce).Set(float64(em.CoinBalance))
+	c.m.EpochDone.WithLabelValues(addr, ce).Set(float64(em.EpochsCompleted))
+	c.m.EpochMissRate.WithLabelValues(addr, ce).Set(state.MissRate(em.InferenceCount, em.MissedRequests))
+
+	if walletOK {
+		c.m.EpochEarnedGNK.WithLabelValues(addr, ce).Set(wallet - c.st.WalletBalanceAtEpochStart)
+	}
+	if c.st.EpochStartTime > 0 {
+		c.m.EpochStartTime.WithLabelValues(addr, ce).Set(c.st.EpochStartTime)
+	}
+	if epochInfo != nil && c.st.EpochStartTime > 0 && c.st.PocStartBlockHeight > 0 && c.st.EpochLength > 0 {
+		blocksElapsed := epochInfo.BlockHeight - c.st.PocStartBlockHeight
+		timeElapsed := now - c.st.EpochStartTime
+		if blocksElapsed > 0 && timeElapsed > 0 {
+			avgBlockTime := timeElapsed / float64(blocksElapsed)
+			blocksRemaining := c.st.EpochLength - blocksElapsed
+			c.m.EpochEndTime.WithLabelValues(addr, ce).Set(now + float64(blocksRemaining)*avgBlockTime)
+		}
+	}
+}
+
+func (c *Collector) fetchAndSetWallet(addr string) (float64, bool) {
+	wallet, err := c.f.FetchWalletBalance(c.cfg.NodeRESTURL, addr)
+	if err != nil {
+		slog.Warn("fetch wallet balance", "err", err)
+		return 0, false
+	}
+	c.m.ParticipantWallet.WithLabelValues(addr).Set(wallet)
+	if c.st.WalletBalanceAtEpochStart == 0 {
+		c.st.WalletBalanceAtEpochStart = wallet
+	}
+	return wallet, true
+}
+
+func (c *Collector) fetchAndSetParticipantStats(addr string) (*fetcher.ParticipantStats, bool) {
+	stats, err := c.f.FetchParticipantStats(c.cfg.NodeRESTURL, addr)
+	if err != nil {
+		slog.Warn("fetch participant stats", "err", err)
+		return nil, false
+	}
+	c.m.ParticipantEpochsDone.WithLabelValues(addr).Set(float64(stats.EpochsCompleted))
+	c.m.ParticipantCoinBalance.WithLabelValues(addr).Set(float64(stats.CoinBalance))
+	c.m.ParticipantInferences.WithLabelValues(addr).Set(float64(stats.InferenceCount))
+	c.m.ParticipantMissed.WithLabelValues(addr).Set(float64(stats.MissedRequests))
+	c.m.ParticipantEarnedCoins.WithLabelValues(addr).Set(float64(stats.EarnedCoins))
+	c.m.ParticipantValidated.WithLabelValues(addr).Set(float64(stats.ValidatedInferences))
+	c.m.ParticipantInvalidated.WithLabelValues(addr).Set(float64(stats.InvalidatedInferences))
+	if sv, ok := participantStatusMap[stats.Status]; ok {
+		c.m.ParticipantStatus.WithLabelValues(addr).Set(sv)
+	}
+	c.m.ParticipantConsecutiveInv.WithLabelValues(addr).Set(float64(stats.ConsecutiveInvalidInferences))
+	c.m.ParticipantBurnedCoins.WithLabelValues(addr).Set(float64(stats.BurnedCoins))
+	c.m.ParticipantRewardedCoins.WithLabelValues(addr).Set(float64(stats.RewardedCoins))
+	return stats, true
+}
+
+func (c *Collector) fetchAndSetBLS(addr string, chainEpoch int64) {
+	if chainEpoch == 0 {
+		return
+	}
+	bls, err := c.f.FetchBLSEpoch(c.cfg.APIURL, chainEpoch)
+	if err != nil {
+		slog.Warn("fetch bls epoch", "err", err)
+		return
+	}
+	c.m.BLSDKGPhase.WithLabelValues(addr).Set(float64(bls.DKGPhase))
+	if bls.DealingPhaseDeadlineBlock > 0 {
+		c.m.BLSDealingDeadline.WithLabelValues(addr).Set(float64(bls.DealingPhaseDeadlineBlock))
+	}
+	if bls.VerifyingPhaseDeadlineBlock > 0 {
+		c.m.BLSVerifyingDeadline.WithLabelValues(addr).Set(float64(bls.VerifyingPhaseDeadlineBlock))
+	}
+}
+
+func (c *Collector) fetchAndSetGroupData(addr string, chainEpoch int64) {
+	groupData, err := c.f.FetchEpochGroupData(c.cfg.NodeRESTURL)
+	if err != nil {
+		slog.Warn("fetch epoch group data", "err", err)
+		return
+	}
+	if groupData.NumberOfRequests > 0 {
+		c.m.NetEpochInferenceCount.WithLabelValues(addr).Set(float64(groupData.NumberOfRequests))
+	}
+	if groupData.TotalWeight > 0 {
+		// emission(N) = 323000 × exp(-0.000475 × (N-1))
+		emission := 323000.0 * math.Exp(-0.000475*float64(groupData.EpochIndex-1))
+		rewardPerWeight := emission / float64(groupData.TotalWeight)
+		c.m.NetTotalWeight.WithLabelValues(addr).Set(float64(groupData.TotalWeight))
+		c.m.NetRewardPerWeight.WithLabelValues(addr).Set(rewardPerWeight)
+		for _, vw := range groupData.ValidationWeights {
+			if vw.MemberAddress == addr {
+				myWeight, _ := strconv.ParseInt(vw.Weight, 10, 64)
+				c.estimatedReward = float64(myWeight) * rewardPerWeight
+				c.m.ParticipantReputation.WithLabelValues(addr).Set(float64(vw.Reputation))
+				if chainEpoch > 0 {
+					ce := strconv.FormatInt(chainEpoch, 10)
+					c.m.EpochEstimated.WithLabelValues(addr, ce).Set(c.estimatedReward)
+				}
+				break
+			}
+		}
+	}
+}
+
+func (c *Collector) fetchAndSetEpochInfo(chainEpoch int64) *fetcher.EpochInfo {
+	epochInfo, err := c.f.FetchEpochInfo(c.cfg.NodeRESTURL)
+	if err != nil {
+		slog.Warn("fetch epoch info", "err", err)
+		return nil
+	}
+	c.st.EpochLength = epochInfo.EpochLength
+	if epochInfo.PocStartBlockHeight != c.st.PocStartBlockHeight {
+		t, err := c.f.FetchBlockTimeAtHeight(c.cfg.NodeRPCURL, epochInfo.PocStartBlockHeight)
+		if err != nil {
+			slog.Warn("fetch block time", "height", epochInfo.PocStartBlockHeight, "err", err)
+		} else {
+			c.st.PocStartBlockHeight = epochInfo.PocStartBlockHeight
+			c.st.EpochStartTime = t
+			slog.Info("epoch start block time",
+				"epoch", chainEpoch,
+				"block", epochInfo.PocStartBlockHeight,
+				"time", time.Unix(int64(t), 0).UTC().Format(time.RFC3339))
+		}
+	}
+	return epochInfo
+}
+
+func (c *Collector) fetchAndSetChainEpoch(addr string) int64 {
+	chainEpoch, err := c.f.FetchCurrentEpoch(c.cfg.NodeRESTURL)
+	if err != nil {
+		slog.Warn("fetch current epoch", "err", err)
+		return 0
+	}
+	c.m.ChainEpoch.WithLabelValues(addr).Set(float64(chainEpoch))
+	return chainEpoch
+}
+
 func (c *Collector) recordSnapshot(epoch int64, startTime, endTime float64, wallet float64, walletOK bool) {
 	addr := c.cfg.Participant
-	em   := c.epochMax[epoch]
+	em := c.epochMax[epoch]
 	if em == nil {
 		em = &state.EpochMaxValues{}
 	}
@@ -416,12 +461,12 @@ func (c *Collector) recordSnapshot(epoch int64, startTime, endTime float64, wall
 	}
 
 	// On-chain performance summary
-	perf, err := fetcher.FetchEpochPerfSummary(c.cfg.NodeRESTURL, addr, epoch)
+	perf, err := c.f.FetchEpochPerfSummary(c.cfg.NodeRESTURL, addr, epoch)
 	if err != nil {
 		slog.Warn("epoch performance summary", "epoch", epoch, "err", err)
 	} else {
 		snap.RewardedGNK = &perf.RewardedGNK
-		snap.Claimed     = &perf.Claimed
+		snap.Claimed = &perf.Claimed
 	}
 
 	epochStr := fmt.Sprintf("%d", epoch)
@@ -432,32 +477,32 @@ func (c *Collector) recordSnapshot(epoch int64, startTime, endTime float64, wall
 	state.SaveHistory(c.cfg.HistoryFile, c.history, c.cfg.MaxHistory)
 
 	ce := strconv.FormatInt(epoch, 10)
-	metrics.EpochInferences.WithLabelValues(addr, ce).Set(float64(snap.InferenceCount))
-	metrics.EpochMissed.WithLabelValues(addr, ce).Set(float64(snap.MissedRequests))
-	metrics.EpochEarnedCoins.WithLabelValues(addr, ce).Set(float64(snap.EarnedCoins))
-	metrics.EpochValidated.WithLabelValues(addr, ce).Set(float64(snap.ValidatedInferences))
-	metrics.EpochInvalidated.WithLabelValues(addr, ce).Set(float64(snap.InvalidatedInferences))
-	metrics.EpochCoinBalance.WithLabelValues(addr, ce).Set(float64(snap.CoinBalance))
-	metrics.EpochDone.WithLabelValues(addr, ce).Set(float64(snap.EpochsCompleted))
-	metrics.EpochMissRate.WithLabelValues(addr, ce).Set(snap.MissRatePercent)
-	metrics.EpochTimeslot.WithLabelValues(addr, ce).Set(float64(snap.TimeslotAssigned))
+	c.m.EpochInferences.WithLabelValues(addr, ce).Set(float64(snap.InferenceCount))
+	c.m.EpochMissed.WithLabelValues(addr, ce).Set(float64(snap.MissedRequests))
+	c.m.EpochEarnedCoins.WithLabelValues(addr, ce).Set(float64(snap.EarnedCoins))
+	c.m.EpochValidated.WithLabelValues(addr, ce).Set(float64(snap.ValidatedInferences))
+	c.m.EpochInvalidated.WithLabelValues(addr, ce).Set(float64(snap.InvalidatedInferences))
+	c.m.EpochCoinBalance.WithLabelValues(addr, ce).Set(float64(snap.CoinBalance))
+	c.m.EpochDone.WithLabelValues(addr, ce).Set(float64(snap.EpochsCompleted))
+	c.m.EpochMissRate.WithLabelValues(addr, ce).Set(snap.MissRatePercent)
+	c.m.EpochTimeslot.WithLabelValues(addr, ce).Set(float64(snap.TimeslotAssigned))
 	for nodeID, pw := range snap.PocWeights {
-		metrics.EpochPocWeight.WithLabelValues(addr, ce, nodeID).Set(float64(pw))
+		c.m.EpochPocWeight.WithLabelValues(addr, ce, nodeID).Set(float64(pw))
 	}
-	metrics.EpochStartTime.WithLabelValues(addr, ce).Set(snap.StartTime)
-	metrics.EpochEndTime.WithLabelValues(addr, ce).Set(snap.EndTime)
-	metrics.EpochDuration.WithLabelValues(addr, ce).Set(snap.DurationSeconds)
+	c.m.EpochStartTime.WithLabelValues(addr, ce).Set(snap.StartTime)
+	c.m.EpochEndTime.WithLabelValues(addr, ce).Set(snap.EndTime)
+	c.m.EpochDuration.WithLabelValues(addr, ce).Set(snap.DurationSeconds)
 	if snap.EarnedGNK != nil {
-		metrics.EpochEarnedGNK.WithLabelValues(addr, ce).Set(*snap.EarnedGNK)
+		c.m.EpochEarnedGNK.WithLabelValues(addr, ce).Set(*snap.EarnedGNK)
 	}
 	if snap.RewardedGNK != nil {
-		metrics.EpochRewardedGNK.WithLabelValues(addr, ce).Set(*snap.RewardedGNK)
+		c.m.EpochRewardedGNK.WithLabelValues(addr, ce).Set(*snap.RewardedGNK)
 	}
 	if snap.EstimatedGNK != nil {
-		metrics.EpochEstimated.WithLabelValues(addr, ce).Set(*snap.EstimatedGNK)
+		c.m.EpochEstimated.WithLabelValues(addr, ce).Set(*snap.EstimatedGNK)
 	}
 	if snap.Claimed != nil {
-		metrics.EpochClaimed.WithLabelValues(addr, ce).Set(float64(*snap.Claimed))
+		c.m.EpochClaimed.WithLabelValues(addr, ce).Set(float64(*snap.Claimed))
 	}
 
 	slog.Info("epoch snapshot saved",
@@ -483,112 +528,132 @@ func (c *Collector) collectNodes() {
 		addr = "unknown"
 	}
 
-	nodes, err := fetcher.FetchNodes(c.cfg.AdminAPIURL)
+	nodes, err := c.f.FetchNodes(c.cfg.AdminAPIURL)
 	if err != nil {
 		slog.Warn("fetch nodes", "err", err)
 		return
 	}
 
+	var wg sync.WaitGroup
+	var mu sync.Mutex
 	for _, entry := range nodes {
-		ni     := entry.Node
-		nodeID := ni.ID
-		host   := ni.Host
-		st     := entry.State
+		wg.Add(1)
+		go func(entry fetcher.NodeEntry) {
+			defer wg.Done()
+			c.collectOneNode(addr, entry, &mu)
+		}(entry)
+	}
+	wg.Wait()
+}
 
-		for _, hw := range ni.Hardware {
-			metrics.NodeHardwareInfo.WithLabelValues(addr, nodeID, host, hw.Type, strconv.Itoa(hw.Count)).Set(1)
+// collectOneNode collects all metrics for a single node.
+// mu protects writes to c.epochNode which is shared across parallel node goroutines.
+func (c *Collector) collectOneNode(addr string, entry fetcher.NodeEntry, mu *sync.Mutex) {
+	ni := entry.Node
+	nodeID := ni.ID
+	host := ni.Host
+	st := entry.State
+
+	for _, hw := range ni.Hardware {
+		c.m.NodeHardwareInfo.WithLabelValues(addr, nodeID, host, hw.Type, strconv.Itoa(hw.Count)).Set(1)
+	}
+
+	c.m.NodeStatus.WithLabelValues(addr, nodeID, host).Set(nodeStatusVal(st.CurrentStatus))
+	c.m.NodeIntended.WithLabelValues(addr, nodeID, host).Set(nodeStatusVal(st.IntendedStatus))
+	c.m.PocCurrent.WithLabelValues(addr, nodeID, host).Set(pocStatusVal(st.PocCurrentStatus))
+	c.m.PocIntended.WithLabelValues(addr, nodeID, host).Set(pocStatusVal(st.PocIntendedStatus))
+
+	for model, md := range st.EpochMLNodes {
+		if md.PocWeight != nil {
+			pw := *md.PocWeight
+			c.m.NodePocWeight.WithLabelValues(addr, nodeID, host, model).Set(float64(pw))
+
+			mu.Lock()
+			if pw > c.epochNode.PocWeights[nodeID] {
+				c.epochNode.PocWeights[nodeID] = pw
+			}
+			curMax := c.epochNode.PocWeights[nodeID]
+			mu.Unlock()
+
+			if c.st.ChainEpoch > 0 {
+				ce := strconv.FormatInt(c.st.ChainEpoch, 10)
+				c.m.EpochPocWeight.WithLabelValues(addr, ce, nodeID).Set(float64(curMax))
+			}
+		}
+		if len(md.TimeslotAllocation) > 0 && md.TimeslotAllocation[0] {
+			c.m.NodeTimeslot.WithLabelValues(addr, nodeID, host, model).Set(1)
+			mu.Lock()
+			c.epochNode.TimeslotAssigned = 1
+			mu.Unlock()
+			if c.st.ChainEpoch > 0 {
+				ce := strconv.FormatInt(c.st.ChainEpoch, 10)
+				c.m.EpochTimeslot.WithLabelValues(addr, ce).Set(1)
+			}
+		} else {
+			c.m.NodeTimeslot.WithLabelValues(addr, nodeID, host, model).Set(0)
+		}
+	}
+
+	if ni.PocPort > 0 && host != "" {
+		gpu := c.f.FetchGPUStats(host, ni.PocPort)
+		c.m.NodeGPUCount.WithLabelValues(addr, nodeID, host).Set(float64(gpu.Count))
+		c.m.NodeGPUUtil.WithLabelValues(addr, nodeID, host).Set(gpu.AvgUtil)
+		for _, dev := range gpu.Devices {
+			di := strconv.Itoa(dev.Index)
+			c.m.NodeGPUDeviceUtil.WithLabelValues(addr, nodeID, host, di).Set(dev.UtilizationPercent)
+			avail := 0.0
+			if dev.IsAvailable {
+				avail = 1.0
+			}
+			c.m.NodeGPUDeviceAvail.WithLabelValues(addr, nodeID, host, di).Set(avail)
+			if dev.TemperatureC != nil {
+				c.m.NodeGPUDeviceTemp.WithLabelValues(addr, nodeID, host, di).Set(*dev.TemperatureC)
+			}
+			if dev.TotalMemoryMB != nil {
+				c.m.NodeGPUDeviceMemTotal.WithLabelValues(addr, nodeID, host, di).Set(float64(*dev.TotalMemoryMB))
+			}
+			if dev.FreeMemoryMB != nil {
+				c.m.NodeGPUDeviceMemFree.WithLabelValues(addr, nodeID, host, di).Set(float64(*dev.FreeMemoryMB))
+			}
+			if dev.UsedMemoryMB != nil {
+				c.m.NodeGPUDeviceMemUsed.WithLabelValues(addr, nodeID, host, di).Set(float64(*dev.UsedMemoryMB))
+			}
 		}
 
-		metrics.NodeStatus.WithLabelValues(addr, nodeID, host).Set(nodeStatusVal(st.CurrentStatus))
-		metrics.NodeIntended.WithLabelValues(addr, nodeID, host).Set(nodeStatusVal(st.IntendedStatus))
-		metrics.PocCurrent.WithLabelValues(addr, nodeID, host).Set(pocStatusVal(st.PocCurrentStatus))
-		metrics.PocIntended.WithLabelValues(addr, nodeID, host).Set(pocStatusVal(st.PocIntendedStatus))
-
-		for model, md := range st.EpochMLNodes {
-			if md.PocWeight != nil {
-				pw := *md.PocWeight
-				metrics.NodePocWeight.WithLabelValues(addr, nodeID, host, model).Set(float64(pw))
-				if pw > c.epochNode.PocWeights[nodeID] {
-					c.epochNode.PocWeights[nodeID] = pw
-				}
-				if c.st.ChainEpoch > 0 {
-					ce := strconv.FormatInt(c.st.ChainEpoch, 10)
-					metrics.EpochPocWeight.WithLabelValues(addr, ce, nodeID).Set(float64(c.epochNode.PocWeights[nodeID]))
-				}
-			}
-			if len(md.TimeslotAllocation) > 0 && md.TimeslotAllocation[0] {
-				metrics.NodeTimeslot.WithLabelValues(addr, nodeID, host, model).Set(1)
-				c.epochNode.TimeslotAssigned = 1
-				if c.st.ChainEpoch > 0 {
-					ce := strconv.FormatInt(c.st.ChainEpoch, 10)
-					metrics.EpochTimeslot.WithLabelValues(addr, ce).Set(1)
-				}
-			} else {
-				metrics.NodeTimeslot.WithLabelValues(addr, nodeID, host, model).Set(0)
-			}
+		// ML node service state
+		if svcState, svcErr := c.f.FetchMLNodeState(host, ni.PocPort); svcErr != nil {
+			slog.Debug("ml node state unavailable", "node", nodeID, "err", svcErr)
+		} else {
+			sv := mlNodeServiceStateMap[svcState]
+			c.m.NodeServiceState.WithLabelValues(addr, nodeID, host).Set(sv)
 		}
 
-		if ni.PocPort > 0 && host != "" {
-			gpu := fetcher.FetchGPUStats(host, ni.PocPort)
-			metrics.NodeGPUCount.WithLabelValues(addr, nodeID, host).Set(float64(gpu.Count))
-			metrics.NodeGPUUtil.WithLabelValues(addr, nodeID, host).Set(gpu.AvgUtil)
-			for _, dev := range gpu.Devices {
-				di := strconv.Itoa(dev.Index)
-				metrics.NodeGPUDeviceUtil.WithLabelValues(addr, nodeID, host, di).Set(dev.UtilizationPercent)
-				avail := 0.0
-				if dev.IsAvailable {
-					avail = 1.0
-				}
-				metrics.NodeGPUDeviceAvail.WithLabelValues(addr, nodeID, host, di).Set(avail)
-				if dev.TemperatureC != nil {
-					metrics.NodeGPUDeviceTemp.WithLabelValues(addr, nodeID, host, di).Set(*dev.TemperatureC)
-				}
-				if dev.TotalMemoryMB != nil {
-					metrics.NodeGPUDeviceMemTotal.WithLabelValues(addr, nodeID, host, di).Set(float64(*dev.TotalMemoryMB))
-				}
-				if dev.FreeMemoryMB != nil {
-					metrics.NodeGPUDeviceMemFree.WithLabelValues(addr, nodeID, host, di).Set(float64(*dev.FreeMemoryMB))
-				}
-				if dev.UsedMemoryMB != nil {
-					metrics.NodeGPUDeviceMemUsed.WithLabelValues(addr, nodeID, host, di).Set(float64(*dev.UsedMemoryMB))
-				}
-			}
+		// ML node disk space
+		if diskGB, diskErr := c.f.FetchMLNodeDiskSpaceGB(host, ni.PocPort); diskErr != nil {
+			slog.Debug("ml node disk space unavailable", "node", nodeID, "err", diskErr)
+		} else {
+			c.m.NodeDiskAvailableGB.WithLabelValues(addr, nodeID, host).Set(diskGB)
+		}
 
-			// ML node service state
-			if svcState, svcErr := fetcher.FetchMLNodeState(host, ni.PocPort); svcErr != nil {
-				slog.Debug("ml node state unavailable", "node", nodeID, "err", svcErr)
-			} else {
-				sv := mlNodeServiceStateMap[svcState]
-				metrics.NodeServiceState.WithLabelValues(addr, nodeID, host).Set(sv)
-			}
+		// GPU driver info
+		if drvInfo, drvErr := c.f.FetchGPUDriverInfo(host, ni.PocPort); drvErr != nil {
+			slog.Debug("gpu driver info unavailable", "node", nodeID, "err", drvErr)
+		} else {
+			c.m.NodeGPUDriverInfo.WithLabelValues(addr, nodeID, host, drvInfo.DriverVersion, drvInfo.CudaDriverVersion).Set(1)
+		}
 
-			// ML node disk space
-			if diskGB, diskErr := fetcher.FetchMLNodeDiskSpaceGB(host, ni.PocPort); diskErr != nil {
-				slog.Debug("ml node disk space unavailable", "node", nodeID, "err", diskErr)
-			} else {
-				metrics.NodeDiskAvailableGB.WithLabelValues(addr, nodeID, host).Set(diskGB)
-			}
-
-			// GPU driver info
-			if drvInfo, drvErr := fetcher.FetchGPUDriverInfo(host, ni.PocPort); drvErr != nil {
-				slog.Debug("gpu driver info unavailable", "node", nodeID, "err", drvErr)
-			} else {
-				metrics.NodeGPUDriverInfo.WithLabelValues(addr, nodeID, host, drvInfo.DriverVersion, drvInfo.CudaDriverVersion).Set(1)
-			}
-
-			// ML node manager health
-			if health, healthErr := fetcher.FetchMLNodeHealth(host, ni.PocPort); healthErr != nil {
-				slog.Debug("ml node health unavailable", "node", nodeID, "err", healthErr)
-			} else {
-				setManagerMetric(addr, nodeID, host, "pow", health.ManagerPow)
-				setManagerMetric(addr, nodeID, host, "inference", health.ManagerInference)
-				setManagerMetric(addr, nodeID, host, "train", health.ManagerTrain)
-			}
+		// ML node manager health
+		if health, healthErr := c.f.FetchMLNodeHealth(host, ni.PocPort); healthErr != nil {
+			slog.Debug("ml node health unavailable", "node", nodeID, "err", healthErr)
+		} else {
+			c.setManagerMetric(addr, nodeID, host, "pow", health.ManagerPow)
+			c.setManagerMetric(addr, nodeID, host, "inference", health.ManagerInference)
+			c.setManagerMetric(addr, nodeID, host, "train", health.ManagerTrain)
 		}
 	}
 }
 
-func setManagerMetric(addr, nodeID, host, manager string, s fetcher.MLNodeManagerStatus) {
+func (c *Collector) setManagerMetric(addr, nodeID, host, manager string, s fetcher.MLNodeManagerStatus) {
 	running := 0.0
 	if s.Running {
 		running = 1.0
@@ -597,8 +662,8 @@ func setManagerMetric(addr, nodeID, host, manager string, s fetcher.MLNodeManage
 	if s.Healthy {
 		healthy = 1.0
 	}
-	metrics.NodeManagerRunning.WithLabelValues(addr, nodeID, host, manager).Set(running)
-	metrics.NodeManagerHealthy.WithLabelValues(addr, nodeID, host, manager).Set(healthy)
+	c.m.NodeManagerRunning.WithLabelValues(addr, nodeID, host, manager).Set(running)
+	c.m.NodeManagerHealthy.WithLabelValues(addr, nodeID, host, manager).Set(healthy)
 }
 
 // --- Restore metrics from history on startup ---
@@ -609,38 +674,38 @@ func (c *Collector) restoreMetrics() {
 		for epochStr, snap := range epochs {
 			p := participant
 			e := epochStr
-			metrics.EpochInferences.WithLabelValues(p, e).Set(float64(snap.InferenceCount))
-			metrics.EpochMissed.WithLabelValues(p, e).Set(float64(snap.MissedRequests))
-			metrics.EpochEarnedCoins.WithLabelValues(p, e).Set(float64(snap.EarnedCoins))
-			metrics.EpochValidated.WithLabelValues(p, e).Set(float64(snap.ValidatedInferences))
-			metrics.EpochInvalidated.WithLabelValues(p, e).Set(float64(snap.InvalidatedInferences))
-			metrics.EpochCoinBalance.WithLabelValues(p, e).Set(float64(snap.CoinBalance))
-			metrics.EpochDone.WithLabelValues(p, e).Set(float64(snap.EpochsCompleted))
-			metrics.EpochMissRate.WithLabelValues(p, e).Set(snap.MissRatePercent)
-			metrics.EpochTimeslot.WithLabelValues(p, e).Set(float64(snap.TimeslotAssigned))
+			c.m.EpochInferences.WithLabelValues(p, e).Set(float64(snap.InferenceCount))
+			c.m.EpochMissed.WithLabelValues(p, e).Set(float64(snap.MissedRequests))
+			c.m.EpochEarnedCoins.WithLabelValues(p, e).Set(float64(snap.EarnedCoins))
+			c.m.EpochValidated.WithLabelValues(p, e).Set(float64(snap.ValidatedInferences))
+			c.m.EpochInvalidated.WithLabelValues(p, e).Set(float64(snap.InvalidatedInferences))
+			c.m.EpochCoinBalance.WithLabelValues(p, e).Set(float64(snap.CoinBalance))
+			c.m.EpochDone.WithLabelValues(p, e).Set(float64(snap.EpochsCompleted))
+			c.m.EpochMissRate.WithLabelValues(p, e).Set(snap.MissRatePercent)
+			c.m.EpochTimeslot.WithLabelValues(p, e).Set(float64(snap.TimeslotAssigned))
 			for nodeID, pw := range snap.PocWeights {
-				metrics.EpochPocWeight.WithLabelValues(p, e, nodeID).Set(float64(pw))
+				c.m.EpochPocWeight.WithLabelValues(p, e, nodeID).Set(float64(pw))
 			}
 			if snap.StartTime > 0 {
-				metrics.EpochStartTime.WithLabelValues(p, e).Set(snap.StartTime)
+				c.m.EpochStartTime.WithLabelValues(p, e).Set(snap.StartTime)
 			}
 			if snap.EndTime > 0 {
-				metrics.EpochEndTime.WithLabelValues(p, e).Set(snap.EndTime)
+				c.m.EpochEndTime.WithLabelValues(p, e).Set(snap.EndTime)
 			}
 			if snap.DurationSeconds > 0 {
-				metrics.EpochDuration.WithLabelValues(p, e).Set(snap.DurationSeconds)
+				c.m.EpochDuration.WithLabelValues(p, e).Set(snap.DurationSeconds)
 			}
 			if snap.EarnedGNK != nil {
-				metrics.EpochEarnedGNK.WithLabelValues(p, e).Set(*snap.EarnedGNK)
+				c.m.EpochEarnedGNK.WithLabelValues(p, e).Set(*snap.EarnedGNK)
 			}
 			if snap.RewardedGNK != nil {
-				metrics.EpochRewardedGNK.WithLabelValues(p, e).Set(*snap.RewardedGNK)
+				c.m.EpochRewardedGNK.WithLabelValues(p, e).Set(*snap.RewardedGNK)
 			}
 			if snap.EstimatedGNK != nil {
-				metrics.EpochEstimated.WithLabelValues(p, e).Set(*snap.EstimatedGNK)
+				c.m.EpochEstimated.WithLabelValues(p, e).Set(*snap.EstimatedGNK)
 			}
 			if snap.Claimed != nil {
-				metrics.EpochClaimed.WithLabelValues(p, e).Set(float64(*snap.Claimed))
+				c.m.EpochClaimed.WithLabelValues(p, e).Set(float64(*snap.Claimed))
 			}
 			total++
 		}
@@ -658,13 +723,7 @@ func (c *Collector) pruneEpochMax() {
 	if len(keys) <= 5 {
 		return
 	}
-	for i := 0; i < len(keys)-1; i++ {
-		for j := i + 1; j < len(keys); j++ {
-			if keys[i] > keys[j] {
-				keys[i], keys[j] = keys[j], keys[i]
-			}
-		}
-	}
+	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
 	for _, k := range keys[:len(keys)-5] {
 		delete(c.epochMax, k)
 	}
@@ -686,13 +745,6 @@ func pocStatusVal(s string) float64 {
 	return v
 }
 
-func max64(a, b int64) int64 {
-	if a > b {
-		return a
-	}
-	return b
-}
-
 func copyMap(m map[string]int64) map[string]int64 {
 	out := make(map[string]int64, len(m))
 	for k, v := range m {
@@ -705,7 +757,7 @@ func copyMap(m map[string]int64) map[string]int64 {
 
 func (c *Collector) collectStats() {
 	// Per-model stats
-	models, err := fetcher.FetchStatsModels(c.cfg.APIURL)
+	models, err := c.f.FetchStatsModels(c.cfg.APIURL)
 	if err != nil {
 		slog.Debug("stats models unavailable", "err", err)
 	} else {
@@ -713,57 +765,57 @@ func (c *Collector) collectStats() {
 			if m.Model == "" {
 				continue
 			}
-			metrics.StatsModelAiTokens.WithLabelValues(m.Model).Set(float64(m.AiTokens))
-			metrics.StatsModelInferences.WithLabelValues(m.Model).Set(float64(m.Inferences))
+			c.m.StatsModelAiTokens.WithLabelValues(m.Model).Set(float64(m.AiTokens))
+			c.m.StatsModelInferences.WithLabelValues(m.Model).Set(float64(m.Inferences))
 		}
 	}
 
 	// Network-wide summary
-	summary, err := fetcher.FetchStatsSummary(c.cfg.APIURL)
+	summary, err := c.f.FetchStatsSummary(c.cfg.APIURL)
 	if err != nil {
 		slog.Debug("stats summary unavailable", "err", err)
 		return
 	}
-	metrics.StatsAiTokens.Set(float64(summary.AiTokens))
-	metrics.StatsInferences.Set(float64(summary.Inferences))
-	metrics.StatsActualCost.Set(float64(summary.ActualCost))
+	c.m.StatsAiTokens.Set(float64(summary.AiTokens))
+	c.m.StatsInferences.Set(float64(summary.Inferences))
+	c.m.StatsActualCost.Set(float64(summary.ActualCost))
 }
 
 // --- Bridge ---
 
 func (c *Collector) collectBridge() {
-	status, err := fetcher.FetchBridgeStatus(c.cfg.APIURL)
+	status, err := c.f.FetchBridgeStatus(c.cfg.APIURL)
 	if err != nil {
 		slog.Debug("bridge status unavailable", "err", err)
 		return
 	}
-	metrics.BridgePendingBlocks.Set(float64(status.PendingBlocks))
-	metrics.BridgePendingReceipts.Set(float64(status.PendingReceipts))
+	c.m.BridgePendingBlocks.Set(float64(status.PendingBlocks))
+	c.m.BridgePendingReceipts.Set(float64(status.PendingReceipts))
 	ready := 0.0
 	if status.ReadyToProcess {
 		ready = 1.0
 	}
-	metrics.BridgeReadyToProcess.Set(ready)
+	c.m.BridgeReadyToProcess.Set(ready)
 	if status.EarliestBlock > 0 {
-		metrics.BridgeEarliestBlock.Set(float64(status.EarliestBlock))
+		c.m.BridgeEarliestBlock.Set(float64(status.EarliestBlock))
 	}
 	if status.LatestBlock > 0 {
-		metrics.BridgeLatestBlock.Set(float64(status.LatestBlock))
+		c.m.BridgeLatestBlock.Set(float64(status.LatestBlock))
 	}
 }
 
 // --- Tokenomics ---
 
 func (c *Collector) collectTokenomics() {
-	tok, err := fetcher.FetchTokenomics(c.cfg.NodeRESTURL)
+	tok, err := c.f.FetchTokenomics(c.cfg.NodeRESTURL)
 	if err != nil {
 		slog.Debug("tokenomics unavailable", "err", err)
 		return
 	}
-	metrics.TokenomicsTotalFees.Set(float64(tok.TotalFees))
-	metrics.TokenomicsTotalSubsidies.Set(float64(tok.TotalSubsidies))
-	metrics.TokenomicsTotalRefunded.Set(float64(tok.TotalRefunded))
-	metrics.TokenomicsTotalBurned.Set(float64(tok.TotalBurned))
+	c.m.TokenomicsTotalFees.Set(float64(tok.TotalFees))
+	c.m.TokenomicsTotalSubsidies.Set(float64(tok.TotalSubsidies))
+	c.m.TokenomicsTotalRefunded.Set(float64(tok.TotalRefunded))
+	c.m.TokenomicsTotalBurned.Set(float64(tok.TotalBurned))
 }
 
 // --- PoC v2 ---
@@ -775,15 +827,15 @@ func (c *Collector) collectPoCv2() {
 	}
 
 	// Artifact count
-	commit, err := fetcher.FetchPoCv2Commit(c.cfg.NodeRESTURL, c.st.PocStartBlockHeight, addr)
+	commit, err := c.f.FetchPoCv2Commit(c.cfg.NodeRESTURL, c.st.PocStartBlockHeight, addr)
 	if err != nil {
 		slog.Debug("poc_v2 commit unavailable", "err", err)
 	} else {
-		metrics.PoCv2ArtifactCount.WithLabelValues(addr).Set(float64(commit.Count))
+		c.m.PoCv2ArtifactCount.WithLabelValues(addr).Set(float64(commit.Count))
 	}
 
 	// Per-node weight distribution
-	weights, err := fetcher.FetchMLNodeWeightDist(c.cfg.NodeRESTURL, c.st.PocStartBlockHeight, addr)
+	weights, err := c.f.FetchMLNodeWeightDist(c.cfg.NodeRESTURL, c.st.PocStartBlockHeight, addr)
 	if err != nil {
 		slog.Debug("poc_v2 node weight dist unavailable", "err", err)
 		return
@@ -792,6 +844,6 @@ func (c *Collector) collectPoCv2() {
 		if w.NodeID == "" {
 			continue
 		}
-		metrics.PoCv2NodeWeight.WithLabelValues(addr, w.NodeID).Set(float64(w.Weight))
+		c.m.PoCv2NodeWeight.WithLabelValues(addr, w.NodeID).Set(float64(w.Weight))
 	}
 }

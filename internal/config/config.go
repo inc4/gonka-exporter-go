@@ -23,14 +23,11 @@ type Config struct {
 	BlockHeightNodes []string
 }
 
+// defaultBlockNodes is a minimal fallback list used when BLOCK_HEIGHT_NODES is not set.
+// Override via BLOCK_HEIGHT_NODES env var in production (comma-separated URLs).
 var defaultBlockNodes = []string{
 	"http://node1.gonka.ai:8000",
 	"http://node2.gonka.ai:8000",
-	"https://node3.gonka.ai",
-	"http://36.189.234.237:17241",
-	"http://47.236.26.199:8000",
-	"http://47.236.19.22:18000",
-	"http://gonka.spv.re:8000",
 }
 
 // Load reads all configuration from environment variables.
