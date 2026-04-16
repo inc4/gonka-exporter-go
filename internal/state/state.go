@@ -132,6 +132,8 @@ func LoadHistory(path string) History {
 		}
 	}
 
+	// TODO: remove after all deployments migrate to format_version=2
+	// Safe to delete after 2026-Q3 (one cycle after this version was deployed).
 	// Old flat format: map[epoch]*EpochSnapshot — migrate by grouping on snap.Participant.
 	var oldH map[string]*EpochSnapshot
 	if err := json.Unmarshal(data, &oldH); err != nil {

@@ -1,6 +1,6 @@
 # Compiled binaries
-exporter
-gonka-exporter
+/exporter
+/gonka-exporter
 *.exe
 
 # Environment files
