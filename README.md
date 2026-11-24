@@ -1,6 +1,8 @@
 # gonka-exporter-go
 
-Prometheus exporter for Gonka network nodes. Collects metrics from the Gonka blockchain, inference nodes, and network participants.
+Prometheus exporter for Gonka inference nodes. It collects metrics from the node, the chain, and network participants, so you can see whether the node is healthy and how much work it does.
+
+Deploy the node with [gonka-nop](https://github.com/inc4/gonka-nop), then monitor it with this exporter.
 
 ## Quick Start
 
